@@ -156,3 +156,103 @@ def view_wallet_account(technical_user_id: str, claims: dict) -> dict:
     if not claims.get("company_id") or claims["company_id"] != account["company_id"]:
         raise _problem(404, "not-found", "no wallet account for this technical user")
     return _view(account)
+
+
+# ---------------------------------------------------------------------------- transitions (README 6.3)
+def _publish(type_: str, account: dict, **extra: Any) -> None:
+    events.publish(MODULE, type_, {"technicalUserId": account["technical_user_id"], "companyId": account["company_id"],
+                                   "walletAccountRef": account["id"], **extra})
+
+
+def _activate(account: dict, token_url: str, client_id: str, secret: str) -> dict:
+    """`REQUESTED` to `ACTIVE`: keep the credentials encrypted until they are retrieved (README 6.7)."""
+    moment = service.now()
+    ciphertext, nonce, key_version = crypto.encrypt(secret)
+    service.get_store().put_account_credentials(
+        account["id"], token_url, client_id, ciphertext, nonce, key_version, moment,
+        moment + dt.timedelta(days=_number("ACCOUNT_CREDENTIALS_RETENTION_DAYS", 30)))
+    account.update(status=ACTIVE, credentials_state=AVAILABLE, failure_reason=None,
+                   provider_ordered_at=account.get("provider_ordered_at") or moment)
+    _save(account)
+    _publish("WalletAccountCreated", account, provider=account["provider"])
+    return account
+
+
+def _fail(account: dict, reason: str) -> dict:
+    account.update(status=FAILED, failure_reason=reason)
+    _save(account)
+    _publish("WalletAccountFailed", account, reason=reason)
+    return account
+
+
+def _delete(account: dict) -> dict:
+    """To `DELETED`: the row of the credentials goes with it (README 6.3)."""
+    service.get_store().delete_account_credentials(account["id"])
+    account["status"] = DELETED
+    _save(account)
+    _publish("WalletAccountDeleted", account)
+    return account
+
+
+# ------------------------------------------------------------------------- create-wallet-account
+def _check_preconditions(company_id: str) -> dict:
+    """README 8.2 preconditions: the wallet is `ACTIVE` (read in the own table), the company is `ACTIVE` at C3-M1."""
+    wallet = service.get_wallet(company_id)
+    if wallet is None or wallet["status"] != "ACTIVE":
+        raise _problem(409, "wallet-not-active", "the wallet of the company is not ACTIVE")
+    company = service.get_company(company_id)
+    if company is None:
+        raise _problem(404, "not-found", "company not found")
+    if company.get("status") != "ACTIVE":
+        raise _problem(409, "company-not-active", "no new wallet account for a company that is not ACTIVE")
+    return wallet
+
+
+def _new_account(technical_user_id: str, company_id: str, wallet: dict) -> dict:
+    moment = service.now()
+    return {"id": str(uuid.uuid4()), "technical_user_id": technical_user_id, "company_id": company_id,
+            "wallet_id": wallet["id"], "provider": wallet["provider"], "status": REQUESTED, "failure_reason": None,
+            "provider_name": f"tu-{technical_user_id}", "provider_ordered_at": None, "deletion_ordered_at": None,
+            "credentials_state": NONE, "created_at": moment, "changed_at": moment}
+
+
+def _order(account: dict, wallet: dict) -> dict:
+    """README 8.2 step 4. `provider_ordered_at` is set only after the provider accepted the order."""
+    adapter = providers.get(account["provider"])
+    order = {"company_id": account["company_id"], "bpn": wallet["bpn"], "technical_user_id": account["technical_user_id"],
+             "wallet_account_ref": account["id"], "provider_name": account["provider_name"]}
+    if adapter.provider == "IDENTITY_HUB":
+        order["sts_access"] = service.wallet_secret(wallet["id"], service.STS_ACCESS)
+    answer = adapter.order_account(order)
+    # An in-process stand-in may already have called back while ordering: continue from the stored row.
+    account = service.get_store().get_account_by_ref(account["id"]) or account
+    if answer["result"] == "CREATED":
+        return _activate(account, answer["token_url"], answer["client_id"], answer["client_secret"])
+    if answer["result"] == "NOT_SUPPORTED":
+        return _fail(account, "NOT_SUPPORTED_BY_PROVIDER")
+    account["provider_ordered_at"] = account.get("provider_ordered_at") or service.now()
+    return _save(account)
+
+
+def create_wallet_account(input: dict) -> dict:
+    """Step `create-wallet-account` (README 8.2)."""
+    technical_user_id, company_id = _validate(input)
+    with _lock(technical_user_id):
+        account = service.get_store().get_account(technical_user_id)
+        if account is not None and account["status"] == DELETED:
+            account = None
+        state = "RUNNING"
+        if account is not None:
+            if account["company_id"] != company_id:
+                raise _problem(409, "conflict", "the technical user has a wallet account of another company")
+            if account["status"] in (ACTIVE, FAILED):
+                return _reply(input, "create-wallet-account", "DONE", account)
+            if account["status"] == DELETING:
+                raise _problem(409, "invalid-state", "the wallet account is being deleted")
+            if account.get("provider_ordered_at"):
+                return _reply(input, "create-wallet-account", state, account)
+        wallet = _check_preconditions(company_id)
+        if account is None:
+            account = _save(_new_account(technical_user_id, company_id, wallet))
+        account = _order(account, wallet)
+        return _reply(input, "create-wallet-account", state, account)
