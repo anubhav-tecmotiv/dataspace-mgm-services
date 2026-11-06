@@ -80,6 +80,8 @@ def _standin(method: str, path: str, body: dict | None) -> tuple[int, dict | Non
     """The built-in IdentityHub: participant contexts in memory (README 11.2)."""
     context = body["participantContextId"] if method == "POST" else path.rsplit("/", 1)[-1]
     bpn = context
+    if method == "DELETE" and os.environ.get("IDENTITYHUB_CONTEXT_ID_ENCODING", "").strip().lower() == "base64":
+        bpn = context = base64.urlsafe_b64decode(context + "=" * (-len(context) % 4)).decode()
     if method == "DELETE":
         with _lock:
             _contexts.pop(context, None)
@@ -130,7 +132,7 @@ class IdentityHubAdapter:
         and create it again."""
         bpn = order["bpn"]
         context, did = _context_id(bpn), self.did_for(bpn)
-        body = {"participantContextId": context, "did": did, "active": True,
+        body = {"participantContextId": bpn, "did": did, "active": True,
                 "key": {"keyId": f"{did}#key-1", "privateKeyAlias": f"{bpn}-key-1",
                         "keyGeneratorParams": {"algorithm": "EC", "curve": "secp256r1"}},
                 "serviceEndpoints": [{"id": f"{did}#credential-service", "type": "CredentialService",
@@ -143,8 +145,8 @@ class IdentityHubAdapter:
             raise common.upstream_error(f"IdentityHub answered {status}")
         identity_api = os.environ.get("IDENTITYHUB_URL", "").strip() or DEFAULT_IDENTITY_API
         return {"result": "CREATED", "did": did, "did_document_location": common.did_location(did),
-                "credential_service_url": _credential_service(context), "provider_ref": context,
-                "secrets": {"HOLDER_ACCESS": {"url": identity_api, "client_id": context, "secret": answer["apiKey"]},
+                "credential_service_url": _credential_service(context), "provider_ref": bpn,
+                "secrets": {"HOLDER_ACCESS": {"url": identity_api, "client_id": bpn, "secret": answer["apiKey"]},
                             "STS_ACCESS": {"url": _sts_token_url(), "client_id": answer["clientId"],
                                            "secret": answer["clientSecret"]}}}
 
