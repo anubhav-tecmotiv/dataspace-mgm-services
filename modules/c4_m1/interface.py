@@ -31,8 +31,10 @@ from __future__ import annotations
 from portal_common import standin
 
 from . import service
-from .service import (  # noqa: F401 - README 8.1, 8.2, 7.4, 9.1
+from .service import (  # noqa: F401 - README 8.1, 8.2, 7.4, 7.2, 7.3, 9.1
+    confirm_revocation,
     issue_credentials,
+    list_credentials,
     query_company_credentials,
     report_status,
     revoke_credentials,

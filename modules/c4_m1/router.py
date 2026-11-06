@@ -28,7 +28,11 @@ Operations that this router does not implement are answered by the spec-driven f
 """
 from __future__ import annotations
 
-from fastapi import Body
+import datetime as dt
+import uuid
+from typing import Literal
+
+from fastapi import Body, Query
 from fastapi.responses import Response
 
 from portal_common import standin
@@ -75,3 +79,25 @@ def own_credentials(companyId: str, claims: dict = standin.perm(MODULE, "GET", "
     """README 7.1; order of checks per 6.5: token, permission, then `company_id` of the token = `companyId`."""
     standin.company_scope(MODULE, claims, companyId)
     return service.list_company_credentials(companyId)
+
+
+@router.get("/credentials")
+def list_credentials(page: int = Query(0, ge=0), size: int = Query(20, ge=1, le=100),
+                     status: list[Literal["REQUESTED", "ISSUED", "FAILED", "CANCELLED", "REVOCATION_PENDING",
+                                          "REVOKED"]] | None = Query(None),
+                     credentialType: Literal["BPN", "MEMBERSHIP"] | None = None,
+                     companyId: uuid.UUID | None = None,
+                     route: Literal["CREDENTIAL_ISSUER", "ISSUER_SERVICE", "CSP_ISSUER", "STUB"] | None = None,
+                     requestedBefore: dt.datetime | None = None,
+                     _: dict = standin.perm(MODULE, "GET", "/credentials")):
+    """README 7.2 (OSP staff, `manage_credentials`)."""
+    return interface.list_credentials(statuses=status, credential_type=credentialType,
+                                      company_id=str(companyId) if companyId else None, route=route,
+                                      requested_before=requestedBefore, page=page, size=size)
+
+
+@router.post("/credentials/{credentialId}/confirm-revocation")
+def confirm_revocation(credentialId: str, body: dict = Body(...),
+                       claims: dict = standin.perm(MODULE, "POST", "/credentials/{credentialId}/confirm-revocation")):
+    """README 7.3 (OSP staff, `manage_credentials`)."""
+    return interface.confirm_revocation(credentialId, body, claims)
