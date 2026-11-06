@@ -31,7 +31,7 @@ from __future__ import annotations
 from portal_common import standin
 
 from . import service
-from .service import issue_credentials  # noqa: F401 - step, README 8.1
+from .service import issue_credentials, report_status  # noqa: F401 - step README 8.1; status report README 7.4
 
 MODULE = "c4-m1"
 

@@ -255,6 +255,30 @@ def report_status(kind: str, bpn: str, status: str, message: str | None = None) 
         # REVOCATION_PENDING, REVOKED, and the remaining combinations: nothing
 
 
+def validate_report(kind: str, body: object) -> tuple[str, str, str | None]:
+    """README 7.4 step 2: unknown kind 404 `not-found`; invalid `bpn` or `status` 400 `validation`.
+    Returns (BPN in upper case, status, message)."""
+    if kind not in ("bpn", "membership"):
+        raise Problem(MODULE, 404, "not-found", detail="credentialKind must be bpn or membership")
+    if not isinstance(body, dict):
+        raise _validation("the body must be an object")
+    bpn, status, message = body.get("bpn"), body.get("status"), body.get("message")
+    if not isinstance(bpn, str) or not BPN_RE.match(bpn):
+        raise _validation("bpn must be BPNL followed by 12 letters or digits")
+    if status not in ("SUCCESSFUL", "UNSUCCESSFUL"):
+        raise _validation("status must be SUCCESSFUL or UNSUCCESSFUL")
+    if message is not None and not isinstance(message, str):
+        raise _validation("message must be a string")
+    return bpn.upper(), status, message
+
+
+def audit(claims: dict, operation: str, company_id: str | None, object_ref: str, result: int) -> None:
+    """Audit log entry of a changing operation over HTTP (README 5 `audit_entry`): identifiers only, no names."""
+    store().append_audit({"id": str(uuid.uuid4()), "occurred_at": now(), "sub": claims.get("sub"),
+                          "client_id": claims.get("azp"), "company_id": claims.get("company_id") or company_id,
+                          "operation": operation, "object_ref": object_ref, "result": str(result)})
+
+
 def _fail(row: dict, message: str | None) -> None:
     _change(row, "FAILED", message, failed_at=now(), failure_reason=_truncate(message, 1000))
     events.publish(MODULE, "CredentialIssuanceFailed", {
