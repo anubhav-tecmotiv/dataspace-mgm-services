@@ -137,6 +137,11 @@ def publish_wallet_document(bpn: str, did: str, credential_service: str | None) 
     publish_document(did, did_document(did, credential_service, with_key="INVALID_DID_DOCUMENT" not in failed))
 
 
+def did_location(did: str) -> str:
+    """Where the DID document of a `did:web` DID lives (did:web method: path segments after the host)."""
+    return "https://" + "/".join(did.split(":")[2:]) + "/did.json"
+
+
 def random_secret() -> str:
     return uuid.uuid4().hex + uuid.uuid4().hex
 
