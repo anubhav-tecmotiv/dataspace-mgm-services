@@ -57,6 +57,7 @@ import jwt
 import pytest
 
 from portal_common import csp as csp_client
+from portal_common import tokens
 from portal_common import events
 from portal_common import http as phttp
 from portal_common import settings
@@ -341,6 +342,7 @@ def test_case_14_unit_request_carries_definition_identifier_format_and_a_timeout
         return httpx.Response(status, json=body, request=httpx.Request(method, url)) if body is not None else \
             httpx.Response(status, request=httpx.Request(method, url))
 
+    tokens._load_jwks()   # load the IAM signing keys before the fake replaces portal_common.http.request
     monkeypatch.setattr(phttp, "request", fake)
     r = issue(w)
     assert r.status_code == 200, r.text
@@ -564,6 +566,7 @@ def test_readme_6_3_rule_2_non_empty_issuer_routes_select_the_configured_route(
         "ISSUER_SERVICE_PARTICIPANT_ID": "issuer", "ISSUER_DID": "did:web:issuer.osp-a.example.org",
         "ISSUER_SERVICE_CREDENTIAL_DEFINITIONS": "BPN:bpn-credential-def,MEMBERSHIP:membership-credential-def",
         "CREDENTIAL_FORMAT": "VC1_0_JWT"})
+    tokens._load_jwks()   # load the IAM signing keys before the fake replaces portal_common.http.request
     monkeypatch.setattr(phttp, "request", fake)
     c = COMPANIES[company]
     r = osp.post(f"{P}/steps/issue-credentials", osp.service("svc-c4-m1"), json=step_input(c["id"]))
