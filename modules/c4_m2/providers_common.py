@@ -128,6 +128,15 @@ def did_document(did: str, credential_service: str | None, with_key: bool = True
     return document
 
 
+def publish_wallet_document(bpn: str, did: str, credential_service: str | None) -> None:
+    """The DID document of a stand-in wallet for the built-in resolution, with the failures of README 14.3:
+    `INVALID_DID_DOCUMENT` has no key, `DID_NOT_RESOLVABLE` is not published at all."""
+    failed = failures(bpn)
+    if "DID_NOT_RESOLVABLE" in failed:
+        return
+    publish_document(did, did_document(did, credential_service, with_key="INVALID_DID_DOCUMENT" not in failed))
+
+
 def random_secret() -> str:
     return uuid.uuid4().hex + uuid.uuid4().hex
 
