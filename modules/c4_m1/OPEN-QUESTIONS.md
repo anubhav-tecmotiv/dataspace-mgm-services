@@ -73,5 +73,8 @@ Each entry names the reading that is implemented (AGENTS.md rule 10).
 21. Five tests patch `portal_common.http.request` before the first token check, so the signing keys are loaded
     through the fake and the call answers 401 (`test_readme_8_1_credential_issuer_route_needs_the_did_document_location`,
     `test_case_14_unit_request_carries_...`, three `test_readme_6_3_rule_2_non_empty_issuer_routes_...`). With the
-    keys pre-loaded they pass. The tests were not changed; decision pending.
-22. `tests/test_c4_m2_flow.py` needs the real C4-M2 (Tasks A and B).
+    keys pre-loaded they pass. Resolved: the three test sites now call `tokens._load_jwks()` before they install
+    their fake (a test fix; the product code is not affected).
+22. `tests/test_c4_m2_flow.py` needs the real C4-M2 (Tasks A and B). Resolved: C4-M2 is merged and the flow tests pass.
+    The stand-in issuer reports under the per-company lock and `flush()` waits for timers that already fired,
+    so a delay of 0 no longer loses the report.

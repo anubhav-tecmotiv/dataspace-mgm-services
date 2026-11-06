@@ -48,6 +48,7 @@ from test_c4_m2_common import (
 )
 
 from portal_common import http as phttp
+from portal_common import tokens
 
 U1 = COMPANIES["u1"]["id"]
 U1_BPN = "BPNLIUK2REMLK3F4"
@@ -625,6 +626,7 @@ def test_readme_8_1_credential_issuer_route_needs_the_did_document_location(osp_
                        "CREDENTIAL_ISSUER_TOKEN_URL": "http://cred-issuer.test/token",
                        "CREDENTIAL_ISSUER_CLIENT_ID": "m1", "CREDENTIAL_ISSUER_CLIENT_SECRET": "s",
                        "CALLBACK_BASE_URL": "http://osp.test"})
+    tokens._load_jwks()   # load the IAM signing keys before the fake replaces portal_common.http.request
     monkeypatch.setattr(phttp, "request", record)
     wallet_fake.set("u4", didDocumentLocation=None)
     assert_problem(issue(osp, cid("u4")), 409, "wallet-not-ready", retryable=False)
