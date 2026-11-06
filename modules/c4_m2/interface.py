@@ -134,4 +134,30 @@ def get_holder_access(*, companyId: str, claims: dict | None = None) -> dict:
     return w["_holder"]
 
 
+# ------------------------------------------------------------------------------- wallet accounts
+# The wallet accounts (README 8.2, 8.3, 9.2) are implemented in accounts.py. It is imported when the
+# function is called, so that this file and accounts.py never import each other at load time. Without
+# accounts.py the stand-in answers.
+def _account_function(name: str):
+    accounts = service.optional_module("accounts")
+    if accounts is not None and hasattr(accounts, name):
+        return getattr(accounts, name)
+    return __getattr__(name)
+
+
+def create_wallet_account(input: dict) -> dict:
+    """Step `create-wallet-account` (README 8.2)."""
+    return _account_function("create_wallet_account")(input)
+
+
+def delete_wallet_account(input: dict) -> dict:
+    """Step `delete-wallet-account` (README 8.3)."""
+    return _account_function("delete_wallet_account")(input)
+
+
+def get_wallet_account_internal(*, technicalUserId: str) -> dict:
+    """Query `getWalletAccountInternal` (README 9.2)."""
+    return _account_function("get_wallet_account_internal")(technicalUserId=technicalUserId)
+
+
 __getattr__ = standin.missing_interface(MODULE)   # steps and queries not implemented yet: stand-in
