@@ -254,35 +254,39 @@ def test_transaction_is_a_reentrant_context_manager(store):
 
 
 def test_transaction_serialises_threads_of_the_same_company_but_not_other_companies(store):
-    inside, release = threading.Event(), threading.Event()
-    attempting, entered = threading.Event(), threading.Event()
-    other_done = threading.Event()
+    # README 6.6. No absence-by-timeout: the order in which the threads work inside their transactions is recorded
+    # under the lock and compared after everything has finished (generous join timeouts, no short waits).
+    inside, release, attempting, other_done = (threading.Event() for _ in range(4))
+    order: list[str] = []
 
     def holder():
         with store.transaction(C1):
             inside.set()
-            assert release.wait(10)
+            assert release.wait(30)
+            order.append("holder-done")
 
     def same_company():
         attempting.set()
         with store.transaction(C1):
-            entered.set()
+            order.append("same-company")
 
     def other_company():
         with store.transaction(C2):
+            order.append("other-company")
             other_done.set()
 
     h = run_in_thread(holder)
-    assert inside.wait(5)
+    assert inside.wait(30)
     s = run_in_thread(same_company)
-    assert attempting.wait(5)
+    assert attempting.wait(30)
     o = run_in_thread(other_company)
-    assert other_done.wait(5), "another company must not be blocked"
-    assert not entered.wait(0.3), "the same company must wait for the open transaction"
+    assert other_done.wait(30), "another company must not be blocked by the open transaction of C1"
     release.set()
-    assert entered.wait(5)
     for th in (h, s, o):
-        th.join(5)
+        th.join(30)
+        assert not th.is_alive()
+    assert order.index("other-company") < order.index("holder-done")   # C2 finished while C1 was still held
+    assert order.index("holder-done") < order.index("same-company")    # the same company waited for the holder
 
 
 def test_transaction_is_released_after_an_exception(store):

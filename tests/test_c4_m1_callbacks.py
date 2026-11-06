@@ -30,6 +30,7 @@ pending), with reports over HTTP, or with `store().put_credential(...)` (README 
 """
 from __future__ import annotations
 
+import datetime as dt
 import uuid
 
 import pytest
@@ -101,9 +102,14 @@ def assert_204(r) -> None:
     assert r.content == b""                                          # README 7.4 step 5: no body
 
 
+def ts(minutes: int = 0) -> dt.datetime:
+    """Store rows hold tz-aware datetimes (TEAM3-PLAN 12.3: `service.now() -> datetime`)."""
+    return dt.datetime(2026, 11, 6, 9, 0, tzinfo=dt.UTC) + dt.timedelta(minutes=minutes)
+
+
 def put_row(company_key: str, ctype: str, status: str, attempt: int = 1, **fields) -> dict:
     c = COMPANIES[company_key]
-    now = "2026-11-06T09:00:00Z"
+    now = ts(0)
     row = {"id": str(uuid.uuid4()), "company_id": c["id"], "credential_type": ctype, "status": status,
            "route": "STUB", "issuer_did": None, "wallet_provider": "STUB", "bpn": c["bpn"].upper(),
            "holder_did": f"did:web:wallet.example.org:{c['bpn']}", "request_ref": f"stub-{attempt}",
@@ -150,7 +156,7 @@ def test_case_06_last_successful_report_completes_the_round_with_one_event(osp_f
 def test_case_06_event_names_only_the_types_of_the_round(osp_factory, companies, wallet_fake):
     # README 6.2 / 8.1: CredentialsIssued carries the types of the round, not all rows
     osp = osp_factory()
-    put_row("u1", "BPN", "ISSUED", 1, issued_at="2026-11-06T09:01:00Z")
+    put_row("u1", "BPN", "ISSUED", 1, issued_at=ts(1))
     start_round(osp, credentialTypes=["MEMBERSHIP"])
     assert_204(report(osp, "membership", U1_BPN))
     evs = osp.events("CredentialsIssued")
@@ -170,6 +176,9 @@ def test_case_06_audit_entry_has_sub_azp_operation_object_and_result(osp_factory
     assert e["sub"] == f"service-account-{SERVICE_ACCOUNT}"          # tools/test_iam.py client_token
     assert U1_BPN in e["object_ref"] and "MEMBERSHIP" in e["object_ref"]   # README 5: BPN and credential type
     assert e["result"] == "204"                                      # README 5: HTTP status as text
+    # OPEN-QUESTION: README 5 `result` = "HTTP status of the response" and 7.4 step 5 (audit entry) comes after the
+    # row handling, so a 404/409 callback could imply an entry with result 404/409 too. The tests assert audit
+    # entries only for 204 reports (and none for a 403); what is written for 404/409 is left to the implementation.
     assert e["id"] and e["occurred_at"]
     # OPEN-QUESTION: README 5 says `company_id` is "from the token, if present"; a service-account token has
     # none, so None is expected; the company of the credential is accepted too.
@@ -308,7 +317,10 @@ def test_readme_7_4_revocation_pending_and_revoked_rows_ignore_reports(osp_facto
 def test_readme_7_4_cancelled_row_with_successful_report_is_revoked_at_once(osp_factory, companies, wallet_fake):
     # README 7.4 / 6.1 last row: CANCELLED + SUCCESSFUL -> revoked immediately: REVOKED + CredentialRevoked
     osp = osp_factory()
+    put_row("u1", "BPN", "ISSUED", 1, issued_at=ts(1))                # the other type of the round is ISSUED ...
     put_row("u1", "MEMBERSHIP", "CANCELLED", 1, revocation_reason="COMPANY_DEACTIVATED")
+    store().put_run({"company_id": U1, "credential_types": TYPES, "status": "CANCELLED",   # ... the round CANCELLED
+                     "process_id": None, "step_run_id": None, "started_at": ts(0), "finished_at": ts(2)})
     assert_204(report(osp, "membership", U1_BPN))
     row = row_of(U1, "MEMBERSHIP")
     assert row["status"] == "REVOKED" and row["revoked_at"]
@@ -319,9 +331,26 @@ def test_readme_7_4_cancelled_row_with_successful_report_is_revoked_at_once(osp_
     assert event_errors("c4-m1", evs[0]) == []
     assert evs[0]["data"] == {"companyId": U1, "credentialType": "MEMBERSHIP",
                               "revocationReason": "COMPANY_DEACTIVATED"}
-    assert osp.events("CredentialsIssued") == []                    # a late report must not complete a round
+    assert osp.events("CredentialsIssued") == []                    # a late report must not complete a CANCELLED round
+    assert store().get_run(U1)["status"] == "CANCELLED"
     assert_204(report(osp, "membership", U1_BPN))                   # the second identical report: nothing
     assert len(osp.events("CredentialRevoked")) == 1
+
+
+def test_readme_7_4_cancelled_row_on_a_route_that_cannot_revoke_becomes_revocation_pending(
+        osp_factory, companies, wallet_fake):
+    # README 7.4 table (CANCELLED + SUCCESSFUL) / 6.1 last row: "revoked immediately: REVOKED or REVOCATION_PENDING";
+    # route CREDENTIAL_ISSUER cannot revoke (6.3) -> REVOCATION_PENDING, and no CredentialRevoked (only with REVOKED)
+    osp = osp_factory()
+    put_row("u4", "MEMBERSHIP", "CANCELLED", 1, route="CREDENTIAL_ISSUER", wallet_provider="SAP_DIV", request_ref="",
+            revocation_reason="COMPANY_DEACTIVATED")
+    assert_204(report(osp, "membership", U4_BPN))
+    row = row_of(U4, "MEMBERSHIP")
+    assert row["status"] == "REVOCATION_PENDING" and not row["revoked_at"]
+    assert history(U4, "MEMBERSHIP")[-1] == ("REVOCATION_PENDING", 1)
+    assert osp.events("CredentialRevoked") == [] and osp.events("CredentialsIssued") == []
+    assert_204(report(osp, "membership", U4_BPN))                   # a second report: nothing
+    assert row_of(U4, "MEMBERSHIP")["status"] == "REVOCATION_PENDING"
 
 
 def test_readme_7_4_cancelled_row_with_unsuccessful_report_does_nothing(osp_factory, companies, wallet_fake):
@@ -427,6 +456,14 @@ def test_case_06_report_without_token_is_unauthorized(osp_factory, companies, wa
     r = osp.post("/api/c4-m1/issuer-callbacks/bpn", json={"bpn": U1_BPN, "status": "SUCCESSFUL"})
     assert_problem(r, 401, "unauthorized")
     assert status_of(U1, "BPN") == "REQUESTED"
+
+
+def test_case_06_unknown_kind_without_token_is_unauthorized_first(osp_factory, companies, wallet_fake):
+    # README 7.4 step 1 before step 2: token missing and kind `foo` -> 401, not 404
+    osp = osp_factory()
+    r = osp.post("/api/c4-m1/issuer-callbacks/foo", json={"bpn": U1_BPN, "status": "SUCCESSFUL"})
+    assert_problem(r, 401, "unauthorized")
+    assert store().list_audit() == []
 
 
 def test_case_06_report_without_permission_is_forbidden(osp_factory, companies, wallet_fake):

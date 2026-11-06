@@ -36,11 +36,17 @@ settings.get("ospId")` (= OSP A here), which is the property the spec states.
 OPEN-QUESTION: the body of the credential request at the wallet identity API is provisional (the spec names
 `issuer`, `holderPid`, credential definition and format, not the JSON keys). The tests assert only what the
 CSP stand-in needs: issuer DID, `holderPid`, `x-api-key`, and the kind (`bpn` / `membership`) in `type` or `id`.
+OPEN-QUESTION: README 4 gives `BPN:bpn-credential,MEMBERSHIP:membership-credential` as the example of
+`CSP_ISSUER_CREDENTIAL_DEFINITIONS`, but the shared CSP stand-in derives the credential kind from `type` or `id` of
+the requested credential and only knows `bpn` / `membership`. The end-to-end tests therefore use
+`BPN:bpn,MEMBERSHIP:membership`; a separate unit test with a recording fake (`test_case_14_unit_...`) uses the
+spec example and asserts that the definition identifier, `CREDENTIAL_FORMAT` and a timeout <= 10 s are sent.
 OPEN-QUESTION: `CALLBACK_BASE_URL` and `CSP_ISSUER_CREDENTIAL_DEFINITIONS` are not set in the shipped config;
 the tests always set them (plan 11 C4-M1 #6: fall back to `settings.base_url()` and `BPN:bpn,MEMBERSHIP:membership`).
 """
 from __future__ import annotations
 
+import datetime as dt
 import json
 import logging
 import threading
@@ -53,6 +59,7 @@ import pytest
 from portal_common import csp as csp_client
 from portal_common import events
 from portal_common import http as phttp
+from portal_common import settings
 from test_c4_m2_common import (
     BASE,
     COMPANIES,
@@ -75,7 +82,7 @@ ISSUER_DID = "did:web:issuer.csp.example.org"
 P = "/api/c4-m1"
 PROBLEM = "urn:c4-m1:problem:"
 CSP_ENV = {"ISSUER_MODE": "CSP", "CSP_ISSUER_URL": ISSUER_URL, "CSP_ISSUER_DID": ISSUER_DID,
-           "CALLBACK_BASE_URL": BASE, "CSP_ISSUER_CREDENTIAL_DEFINITIONS": "BPN:bpn,MEMBERSHIP:membership",
+           "CALLBACK_BASE_URL": BASE, "CSP_ISSUER_CREDENTIAL_DEFINITIONS": "BPN:bpn,MEMBERSHIP:membership",   # see the OPEN-QUESTION above
            "CREDENTIAL_FORMAT": "VC1_0_JWT", "RESEND_AFTER_HOURS": "24"}
 
 
@@ -88,7 +95,8 @@ class Traffic:
         self.rules: list[tuple] = []
         real = phttp.request
 
-        def request(method, url, *a, **kw):
+        def request(method, url, timeout=phttp.DEFAULT_TIMEOUT, **kw):
+            kw = {**kw, "timeout": timeout}                    # the effective per-call timeout is recorded too
             self.calls.append((method, url, kw))
             for match, action in list(self.rules):
                 if match(method, url, kw):
@@ -96,7 +104,7 @@ class Traffic:
                         raise action
                     return httpx.Response(action, json={"type": "about:blank", "status": action},
                                           request=httpx.Request(method, url))
-            return real(method, url, *a, **kw)
+            return real(method, url, **kw)
 
         monkeypatch.setattr(phttp, "request", request)
 
@@ -213,7 +221,7 @@ def not_requested(cid: str, *types: str) -> None:
 
 
 def seed_csp_row(w: World, ctype: str, status: str, **kw) -> dict:
-    now = __import__("datetime").datetime(2026, 11, 6, 8, 0, tzinfo=__import__("datetime").UTC)
+    now = dt.datetime(2026, 11, 6, 8, 0, tzinfo=dt.UTC)
     r = {"id": str(uuid.uuid4()), "company_id": U6["id"], "credential_type": ctype, "status": status,
          "route": "CSP_ISSUER", "issuer_did": ISSUER_DID, "wallet_provider": "CSP", "bpn": w.bpn, "holder_did": w.did,
          "request_ref": f"{U6['id']}:{ctype}:1", "attempt": 1, "requested_at": now,
@@ -248,6 +256,8 @@ def test_case_14_csp_issuer_registers_holder_sets_grants_and_requests_in_the_wal
     assert form["grant_type"] == "client_credentials" and form["client_assertion_type"] == csp_client.ASSERTION_TYPE
     claims = jwt.decode(form["client_assertion"], options={"verify_signature": False})
     assert claims["iss"] == claims["sub"] == OSP_A_ID
+    # --- README 4: time limit per call to the CSP is 10 seconds
+    assert t.csp() and all(c[2]["timeout"] <= 10 for c in t.csp()), [c[2]["timeout"] for c in t.csp()]
     # --- holder: PUT /holders/{bpn} with the DID, once per run
     holders = t.to(f"{ISSUER_URL}/holders/{w.bpn}", "PUT")
     holders = [c for c in holders if c[1] == f"{ISSUER_URL}/holders/{w.bpn}"]
@@ -258,7 +268,7 @@ def test_case_14_csp_issuer_registers_holder_sets_grants_and_requests_in_the_wal
     assert set(grants) == {"bpn", "membership"}
     assert grants["bpn"] == {"callbackUrl": f"{BASE}/api/c4-m1/issuer-callbacks/bpn"}
     assert grants["membership"] == {"callbackUrl": f"{BASE}/api/c4-m1/issuer-callbacks/membership",
-                                    "memberOf": "Catena-X"}   # dataspace.memberOf of the installation settings
+                                    "memberOf": settings.get("dataspace")["memberOf"]}   # README 11.5: from the settings
     assert set(w.osp.csp.grants) == {(w.bpn, "bpn"), (w.bpn, "membership")}
     # --- credential requests at the wallet identity API, header x-api-key, holderPid, issuer
     reqs = t.to(f"{CSP_URL}/identity/v1/participants/{w.pcid}/credentials/request", "POST")
@@ -308,6 +318,44 @@ def test_case_14_csp_issuer_registers_holder_sets_grants_and_requests_in_the_wal
         ("BPN", "CSP_ISSUER", ISSUER_DID), ("MEMBERSHIP", "CSP_ISSUER", ISSUER_DID)}
 
 
+def test_case_14_unit_request_carries_definition_identifier_format_and_a_timeout_of_at_most_10_seconds(
+        osp_factory, companies, wallet_fake, monkeypatch):
+    # README 11.5 step 3 / 11.4: the credential request names `CSP_ISSUER_DID`, the identifier from
+    # CSP_ISSUER_CREDENTIAL_DEFINITIONS (spec example) and `CREDENTIAL_FORMAT`; README 4: 10 s limit per call to the CSP.
+    # A recording fake replaces `portal_common.http.request`, so the shared CSP stand-in does not have to know the ids.
+    w = start_csp(osp_factory, wallet_fake, monkeypatch, env={
+        "CSP_ISSUER_CREDENTIAL_DEFINITIONS": "BPN:bpn-credential,MEMBERSHIP:membership-credential",
+        "CREDENTIAL_FORMAT": "VC1_0_JWT"})
+    calls: list[tuple[str, str, dict]] = []
+
+    def fake(method, url, timeout=phttp.DEFAULT_TIMEOUT, **kw):
+        calls.append((method, url, {**kw, "timeout": timeout}))
+        if url.endswith("/oauth/token"):
+            body, status = {"access_token": "csp-token", "token_type": "Bearer", "expires_in": 300}, 200
+        elif url.endswith("/credentials/request"):
+            body, status = {"holderPid": (kw.get("json") or {}).get("holderPid"), "state": "REQUESTED"}, 202
+        elif "/grants/" in url:
+            body, status = None, 204
+        else:
+            body, status = {"bpn": w.bpn, "did": w.did}, 201
+        return httpx.Response(status, json=body, request=httpx.Request(method, url)) if body is not None else \
+            httpx.Response(status, request=httpx.Request(method, url))
+
+    monkeypatch.setattr(phttp, "request", fake)
+    r = issue(w)
+    assert r.status_code == 200, r.text
+    reqs = [c for c in calls if c[0] == "POST" and c[1].endswith("/credentials/request")]
+    assert len(reqs) == 2
+    blobs = {("bpn" if "bpn-credential" in json.dumps(kw["json"]) else "membership"): json.dumps(kw["json"])
+             for _m, _u, kw in reqs}
+    assert set(blobs) == {"bpn", "membership"}
+    assert "membership-credential" in blobs["membership"] and "bpn-credential" not in blobs["membership"]
+    for blob in blobs.values():
+        assert ISSUER_DID in blob and "VC1_0_JWT" in blob                  # issuer and CREDENTIAL_FORMAT
+    to_csp = [c for c in calls if c[1].startswith(CSP_URL)]
+    assert to_csp and all(c[2]["timeout"] <= 10 for c in to_csp), [(c[1], c[2]["timeout"]) for c in to_csp]
+
+
 def test_case_14_holder_access_is_fetched_once_and_never_sent_to_the_csp_issuer(
         osp_factory, companies, wallet_fake, monkeypatch, caplog):
     # README 4 "Secrets", 13 case 14: "No holder access goes to the CSP"; secret in no log, event, result, store
@@ -317,7 +365,7 @@ def test_case_14_holder_access_is_fetched_once_and_never_sent_to_the_csp_issuer(
     w.callbacks.wait(2)
     assert w.fake.holder_access_calls == [U6["id"]]        # once per run, just before the first order
     for _m, url, kw in w.traffic.to(ISSUER_URL) + w.traffic.to(CSP_URL + "/oauth/token"):
-        blob = json.dumps({k: v for k, v in kw.items() if k != "timeout"}, default=str)
+        blob = json.dumps(kw, default=str)
         assert w.api_key not in blob and w.pcid not in blob, f"holder access sent to the CSP: {url}"
     assert_no_secret(w.api_key, caplog.text, events.RELAY.log, r.text, store().dump(), store().list_audit(),
                      store().list_history(store().get_credential(U6["id"], "BPN")["id"]))
@@ -418,6 +466,48 @@ def test_revoke_of_issued_credential_with_technical_failure_is_502_and_stays_iss
     assert store().get_credential_by_id(row["id"])["status"] == "REVOKED" and len(w.osp.events("CredentialRevoked")) == 1
 
 
+def test_readme_8_2_partial_technical_failure_keeps_the_revoked_type_revoked_and_a_repetition_does_the_rest(
+        osp_factory, companies, wallet_fake, monkeypatch):
+    # README 8.2 ISSUED bullet: "Technical error: 502 upstream-error; credentials already revoked stay revoked, a
+    # repetition does the rest". Types in the given order: BPN first (succeeds), MEMBERSHIP (DELETE fails).
+    w = start_csp(osp_factory, wallet_fake, monkeypatch)
+    bpn = seed_csp_row(w, "BPN", "ISSUED")
+    ms = seed_csp_row(w, "MEMBERSHIP", "ISSUED")
+    csp_has_grant(w, "bpn")
+    csp_has_grant(w, "membership")
+    w.traffic.fail(lambda m, u, kw: delete_grant_rule(m, u, kw) and u.endswith("/membership"), 503)
+    r = revoke(w, credentialTypes=["BPN", "MEMBERSHIP"])
+    assert_problem(r, 502, "upstream-error", True)
+    assert store().get_credential_by_id(bpn["id"])["status"] == "REVOKED"
+    assert store().get_credential_by_id(ms["id"])["status"] == "ISSUED"
+    assert [e["data"]["credentialType"] for e in w.osp.events("CredentialRevoked")] == ["BPN"]
+    w.traffic.clear_rules()
+    r = revoke(w, n=10, credentialTypes=["BPN", "MEMBERSHIP"])
+    assert r.status_code == 200 and r.json()["state"] == "DONE"
+    assert r.json()["result"]["revoked"] == ["MEMBERSHIP"]                 # BPN is not revoked a second time
+    assert [store().get_credential_by_id(x["id"])["status"] for x in (bpn, ms)] == ["REVOKED", "REVOKED"]
+    assert sorted(e["data"]["credentialType"] for e in w.osp.events("CredentialRevoked")) == ["BPN", "MEMBERSHIP"]
+    assert [u.rsplit("/", 1)[1] for _m, u, _kw in w.traffic.to(ISSUER_URL, "DELETE")] == [
+        "bpn", "membership", "membership"]
+
+
+def test_readme_6_6_existing_holder_and_existing_grant_count_as_success(osp_factory, companies, wallet_fake,
+                                                                          monkeypatch):
+    # README 6.6 / 11.4 / 11.5: "an existing holder or an existing grant counts as success": the holder is already
+    # registered at the CSP stand-in (PUT /holders -> 200 instead of 201) and the grants exist as well
+    w = start_csp(osp_factory, wallet_fake, monkeypatch)
+    csp_has_grant(w, "bpn")
+    csp_has_grant(w, "membership")                                          # holder and both grants exist
+    r = issue(w)
+    assert r.status_code == 200 and r.json()["state"] == "RUNNING", r.text
+    w.callbacks.wait(2)
+    puts = [c for c in w.traffic.to(f"{ISSUER_URL}/holders/{w.bpn}", "PUT") if "/grants/" not in c[1]]
+    assert len(puts) == 1
+    assert {store().get_credential(U6["id"], t)["status"] for t in ("BPN", "MEMBERSHIP")} == {"ISSUED"}
+    assert len(w.osp.events("CredentialsIssued")) == 1
+    assert w.osp.events("CredentialIssuanceFailed") == []
+
+
 # ------------------------------------------------------------------------ case 15: route must fit
 def test_case_15_csp_mode_with_sap_div_wallet_is_no_issuer_route_and_no_csp_call(
         osp_factory, companies, wallet_fake, monkeypatch):
@@ -446,6 +536,55 @@ def test_readme_6_3_rule_4_route_must_fit_the_issuance_mode(
     assert store().get_credential(c["id"], "BPN") is None and wallet_fake.holder_access_calls == []
 
 
+ROUTES_ALL = "SAP_DIV:CREDENTIAL_ISSUER,IDENTITY_HUB:ISSUER_SERVICE,CSP:ISSUER_SERVICE"
+
+
+@pytest.mark.parametrize("company,route,host", [
+    ("u4", "CREDENTIAL_ISSUER", "http://cred-issuer.test"),
+    ("u5", "ISSUER_SERVICE", "http://is-admin.test"),
+    ("u6", "ISSUER_SERVICE", "http://is-admin.test"),
+])
+def test_readme_6_3_rule_2_non_empty_issuer_routes_select_the_configured_route(
+        osp_factory, companies, wallet_fake, monkeypatch, company, route, host):
+    # README 6.3 rule 2 (+ rule 4: the route fits the issuance mode): the route of the wallet provider comes from
+    # ISSUER_ROUTES, is stored with the order, and the order goes to that route. Only the route selection is
+    # tested, not the full order protocol: a recording fake answers every call with 2xx.
+    calls: list[tuple[str, str]] = []
+
+    def fake(method, url, timeout=phttp.DEFAULT_TIMEOUT, **kw):
+        calls.append((method, url))
+        return httpx.Response(200, json={"access_token": "t", "token_type": "Bearer", "expires_in": 300},
+                              request=httpx.Request(method, url))
+
+    osp = osp_factory({
+        "ISSUER_MODE": "OWN", "ISSUER_ROUTES": ROUTES_ALL, "CALLBACK_BASE_URL": BASE,
+        "CREDENTIAL_ISSUER_URL": "http://cred-issuer.test", "CREDENTIAL_ISSUER_TOKEN_URL": "http://cred-issuer.test/token",
+        "CREDENTIAL_ISSUER_CLIENT_ID": "m1", "CREDENTIAL_ISSUER_CLIENT_SECRET": "s",
+        "ISSUER_SERVICE_ADMIN_URL": "http://is-admin.test", "ISSUER_SERVICE_API_KEY": "k",
+        "ISSUER_SERVICE_PARTICIPANT_ID": "issuer", "ISSUER_DID": "did:web:issuer.osp-a.example.org",
+        "ISSUER_SERVICE_CREDENTIAL_DEFINITIONS": "BPN:bpn-credential-def,MEMBERSHIP:membership-credential-def",
+        "CREDENTIAL_FORMAT": "VC1_0_JWT"})
+    monkeypatch.setattr(phttp, "request", fake)
+    c = COMPANIES[company]
+    r = osp.post(f"{P}/steps/issue-credentials", osp.service("svc-c4-m1"), json=step_input(c["id"]))
+    assert r.status_code == 200, r.text
+    assert store().get_credential(c["id"], "BPN")["route"] == route
+    assert store().get_credential(c["id"], "MEMBERSHIP")["route"] == route
+    assert any(u.startswith(host) for _m, u in calls), calls               # the order goes to the configured route
+    other = "http://is-admin.test" if host == "http://cred-issuer.test" else "http://cred-issuer.test"
+    assert not any(u.startswith(other) for _m, u in calls)
+
+
+def test_bring_your_own_wallet_has_no_route_with_a_non_empty_issuer_routes(osp_factory, companies, wallet_fake):
+    # README 6.3 last paragraph / rule 2: provider BRING_YOUR_OWN has no entry in ISSUER_ROUTES -> 409 no-issuer-route
+    # (OPEN-QUESTION as above: CREDENTIAL_OFFER is rejected before rule 2)
+    osp = osp_factory({"ISSUER_MODE": "OWN", "ISSUER_ROUTES": ROUTES_ALL})
+    byo = COMPANIES["u7_byo"]
+    r = osp.post(f"{P}/steps/issue-credentials", osp.service("svc-c4-m1"), json=step_input(byo["id"]))
+    assert_problem(r, 409, "no-issuer-route", False)
+    assert store().get_credential(byo["id"], "BPN") is None and wallet_fake.holder_access_calls == []
+
+
 def test_readme_6_3_rule_2_wallet_provider_without_entry_in_issuer_routes(osp_factory, companies, wallet_fake):
     # README 6.3 rule 2: ISSUER_ROUTES set but no entry for the provider -> 409 no-issuer-route
     osp = osp_factory({"ISSUER_MODE": "OWN", "ISSUER_ROUTES": "IDENTITY_HUB:ISSUER_SERVICE"})
@@ -455,6 +594,9 @@ def test_readme_6_3_rule_2_wallet_provider_without_entry_in_issuer_routes(osp_fa
 
 def test_bring_your_own_wallet_has_no_route_in_the_csp_mode_either(osp_factory, companies, wallet_fake, monkeypatch):
     # README 6.3 last paragraph: BRING_YOUR_OWN / CREDENTIAL_OFFER has no route in 0.2
+    # OPEN-QUESTION: README 6.3 rule 2 (OWN + empty ISSUER_ROUTES => STUB) vs case 5 (BRING_YOUR_OWN => 409
+    # no-issuer-route): case 5 wins; the issuance mode CREDENTIAL_OFFER is rejected BEFORE rule 2 (and before the STUB
+    # rule 3 of the CSP mode with an empty CSP_ISSUER_URL).
     w = start_csp(osp_factory, wallet_fake, monkeypatch)
     byo = COMPANIES["u7_byo"]
     r = issue(w, byo)
@@ -650,9 +792,9 @@ def test_case_19_wallet_answering_401_for_the_api_key_is_502_upstream_error(
     assert "wrong-api-key" not in r.text
 
 
-def test_case_19_holder_access_not_available_is_502_or_409_never_a_requested_row(
+def test_case_19_wallet_not_active_is_409_wallet_not_ready_and_no_requested_row(
         osp_factory, companies, wallet_fake, monkeypatch):
-    # README 8.1 precondition: wallet must be ACTIVE (409 wallet-not-ready); no order may be created
+    # README 8.1 precondition: wallet must be ACTIVE (409 wallet-not-ready, before any call); no REQUESTED row
     w = start_csp(osp_factory, wallet_fake, monkeypatch)
     wallet_fake.set("u6", status="REQUESTED")
     r = issue(w)

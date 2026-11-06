@@ -35,7 +35,9 @@ callback with the stand-in's DID can reach ACTIVE.
 """
 from __future__ import annotations
 
-import copy
+import json
+import logging
+import threading
 
 import jwt
 import pytest
@@ -126,6 +128,11 @@ def problem_type(r) -> str:
     return r.json()["type"]
 
 
+def audit_of(azp: str) -> list[dict]:
+    """Audit entries of one caller. Not absolute counts: README 5 does not say what else is audited."""
+    return [e for e in m2().store().list_audit() if e.get("azp") == azp]
+
+
 def snapshot(company: dict) -> dict:
     w = row(company)
     return {k: w[k] for k in ("status", "did", "failure_reason", "attempt", "validating_since", "next_check_at",
@@ -158,7 +165,10 @@ def test_case_06_other_service_account_with_the_permission_is_403(osp_factory, c
     r = send(osp, DIV, body(DIV), token=other)
     assert r.status_code == 403 and problem_type(r) == "urn:c4-m2:problem:forbidden"
     assert row(DIV)["status"] == "REQUESTED" and row(DIV)["did"] is None
-    assert not m2().store().list_audit()                                 # nothing accepted
+    # Our convention (TEAM3-PLAN 12.2, not README text): a 403 is not an accepted callback and is not audited.
+    # OPEN-QUESTION: README 5 / 7.6 say "every callback writes an audit log entry with azp" without saying
+    # whether a rejected one counts; only entries of the rejected client are looked at.
+    assert audit_of("sa-other-callback") == []
 
 
 def test_case_06_check_order_permission_then_client_then_lookup(osp_factory, companies):
@@ -209,9 +219,10 @@ def test_callback_with_a_malformed_body_is_400_validation(osp_factory, companies
 
 
 # ------------------------------------------------------------------------- the valid callback (7.6)
-def test_valid_callback_stores_the_access_encrypted_and_moves_to_validating(osp_factory, companies):
+def test_valid_callback_stores_the_access_encrypted_and_moves_to_validating(osp_factory, companies, caplog):
     # README 7.6 steps 4 and 5, README 5 (wallet_secret), 6.2 REQUESTED -> VALIDATING.
     # DID_NOT_RESOLVABLE keeps the wallet VALIDATING so that the state after step 5 is visible.
+    caplog.set_level(logging.DEBUG)                   # README 4: no secrets in logs, whatever the level
     osp = start(osp_factory, env={"STUB_FAILURES": f"{DIV['bpn']}:DID_NOT_RESOLVABLE"})
     wid = row(DIV)["id"]
     r = send(osp, DIV, body(DIV, document=did_document(did_of(DIV), "https://div.example.org/cs/v1")))
@@ -227,12 +238,14 @@ def test_valid_callback_stores_the_access_encrypted_and_moves_to_validating(osp_
     assert secret["url"] == "https://div.example.org/auth" and secret["client_id"] == "div-client-1"
     assert {"secret_encrypted", "nonce", "key_version"} <= set(secret)
     assert isinstance(secret["secret_encrypted"], bytes) and SECRET.encode() not in secret["secret_encrypted"]
+    # OPEN-QUESTION: nonce of 12 bytes is our convention (AES-GCM default), README 5 only says `nonce bytea`
     assert len(secret["nonce"]) == 12 and secret["key_version"] == 1     # AES-GCM nonce, SECRETS_KEY_VERSION
     assert "clientSecret" not in secret and SECRET not in secret.values()
     assert seam("modules.c4_m2.crypto").decrypt(secret["secret_encrypted"], secret["nonce"],
                                                 secret["key_version"]) == SECRET
     assert ev(osp, "DataspaceWalletCreated") == [] and ev(osp, "DataspaceWalletFailed") == []
-    assert_no_secret(SECRET, m2().store().dump(), osp.events(), r.text)
+    assert_no_secret(SECRET, m2().store().dump(), osp.events(), r.text, caplog.text)
+    assert_no_secret(SECRET, m2().store().list_audit(), m2().store().list_step_log())
 
 
 def test_valid_callback_completes_to_active_with_one_event(osp_factory, companies):
@@ -259,6 +272,8 @@ def test_callback_driven_completion_in_the_default_flow(osp_factory, companies):
     osp = start(osp_factory)
     assert row(DIV)["status"] == "REQUESTED"
     providers().flush_stand_in()
+    assert row(DIV)["status"] in ("VALIDATING", "ACTIVE")      # README 7.6 step 6: background check after the commit
+    service().run_timer_once()
     w = row(DIV)
     assert w["status"] == "ACTIVE" and w["did"] == did_of(DIV)
     secret = m2().store().get_secret(w["id"], "HOLDER_ACCESS")        # the stand-in's made-up access
@@ -284,7 +299,7 @@ def test_every_accepted_callback_writes_an_audit_entry_with_azp_and_no_secret(os
     token = div_token(osp)
     c = claims(token)
     assert send(osp, DIV, body(DIV), token=token).status_code == 204
-    entries = m2().store().list_audit()
+    entries = audit_of("sa-div-callback")            # only this caller: the order itself may be audited too
     assert len(entries) == 1
     e = entries[0]
     assert {"occurred_at", "sub", "azp", "company_id", "operation", "object_id"} <= set(e)
@@ -295,7 +310,7 @@ def test_every_accepted_callback_writes_an_audit_entry_with_azp_and_no_secret(os
     assert_no_secret(SECRET, entries)
     # a duplicate is an accepted callback too (204)
     assert send(osp, DIV, body(DIV), token=token).status_code == 204
-    assert len(m2().store().list_audit()) == 2
+    assert len(audit_of("sa-div-callback")) == 2
     assert_no_secret(SECRET, m2().store().list_audit(), m2().store().dump())
 
 
@@ -316,6 +331,7 @@ def test_duplicate_callback_when_active_is_204_without_second_event(osp_factory,
     # README 7.6 step 2 (ACTIVE with the same DID)
     osp = start(osp_factory)
     providers().flush_stand_in()
+    service().run_timer_once()
     before = snapshot(DIV)
     assert before["status"] == "ACTIVE"
     r = send(osp, DIV, body(DIV))
@@ -332,6 +348,7 @@ def test_callback_with_another_did_is_409_conflict(osp_factory, companies, statu
         assert send(osp, DIV, body(DIV)).status_code == 204
     else:
         providers().flush_stand_in()
+        service().run_timer_once()
     assert row(DIV)["status"] == status
     before = snapshot(DIV)
     other = "did:web:div.example.org:did:BPNL0000000DIV02"
@@ -377,7 +394,7 @@ def test_case_04_callback_with_wrong_did_form_is_204_and_fails_with_did_mismatch
     service().run_timer_once()                                    # no further attempts
     assert row(DIV)["status"] == "FAILED" and len(ev(osp, "DataspaceWalletFailed")) == 1
     assert ev(osp, "DataspaceWalletCreated") == []
-    assert len(m2().store().list_audit()) == 1                    # accepted (204), so it is audited
+    assert len(audit_of("sa-div-callback")) == 1                  # accepted (204), so it is audited
 
 
 def _drop(key):
@@ -392,16 +409,19 @@ def _vm(mutation):
     return f
 
 
+# README 7.6 step 4 checks the callback BODY: `@context` list, `id`, `service` list with `id` and `type`,
+# `verificationMethod` list with `id`, `type`, `publicKeyJwk` with `kty`, `crv`, `x`, `y`.
+# OPEN-QUESTION: openapi marks @context, id, service, verificationMethod as `required` inside `didDocument` (a
+# schema check would answer 400 `validation`), README 7.6 step 4 wants 204 + FAILED/INVALID_DID_DOCUMENT: the
+# route must not enforce the inner `required` list of didDocument. We expect 204.
 INVALID_DOCS = {
     "no @context": _drop("@context"),
     "@context not a list": lambda d: d.update({"@context": "https://www.w3.org/ns/did/v1"}),
     "no id": _drop("id"),
-    "id differs from the DID": lambda d: d.update({"id": "did:web:div.example.org:did:BPNL0000000DIV99"}),
     "no service list": _drop("service"),
     "service without type": lambda d: d["service"][0].pop("type"),
     "service without id": lambda d: d["service"][0].pop("id"),
     "no verificationMethod": _drop("verificationMethod"),
-    "empty verificationMethod": lambda d: d.update({"verificationMethod": []}),
     "verificationMethod without id": _vm(lambda v: v.pop("id")),
     "verificationMethod without type": _vm(lambda v: v.pop("type")),
     "verificationMethod without publicKeyJwk": _vm(lambda v: v.pop("publicKeyJwk")),
@@ -431,8 +451,40 @@ def test_callback_with_invalid_did_document_is_204_and_fails_with_invalid_did_do
     assert len(ev(osp, "DataspaceWalletFailed")) == 1
 
 
+@pytest.mark.parametrize("what,mutation", [
+    ("id differs from the DID", lambda d: d.update({"id": "did:web:div.example.org:did:BPNL0000000DIV99"})),
+    ("empty verificationMethod", lambda d: d.update({"verificationMethod": []})),
+])
+def test_resolved_document_content_is_checked_by_the_did_check_not_by_the_callback(osp_factory, companies, tmp_path,
+                                                                                 monkeypatch, what, mutation):
+    # README 6.4 step 3 on the RESOLVED document: `id` equals the DID, at least one verificationMethod with
+    # publicKeyJwk. The callback body below is valid (7.6 step 4), so the wallet goes VALIDATING; the document the
+    # resolution finds (TEST_DID_DOCUMENTS_DIR, file name = host, README 11.4) is the invalid one.
+    # OPEN-QUESTION: the directory is used first (README 4 "before any resolution"), see test_c4_m2_providers.
+    bad = did_document(did_of(DIV))
+    mutation(bad)
+    (tmp_path / "dids").mkdir()
+    (tmp_path / "dids" / "div.example.org.json").write_text(json.dumps(bad))
+    osp = start(osp_factory, env={"TEST_DID_DOCUMENTS_DIR": str(tmp_path / "dids")})
+    clock = Clock().install(monkeypatch, "modules.c4_m2.service")
+    r = send(osp, DIV, body(DIV))                                  # valid body
+    assert r.status_code == 204
+    assert row(DIV)["status"] in ("VALIDATING", "FAILED")          # the background check may already have run
+    service().run_timer_once()
+    w = row(DIV)
+    assert w["status"] == "FAILED" and w["failure_reason"] == "INVALID_DID_DOCUMENT", what
+    failed = ev(osp, "DataspaceWalletFailed")
+    assert len(failed) == 1 and event_errors(MODULE, failed[0]) == []
+    assert failed[0]["data"]["reason"] == "INVALID_DID_DOCUMENT"
+    clock.advance(minutes=30)                                      # without further attempts
+    service().run_timer_once()
+    assert row(DIV)["status"] == "FAILED" and len(ev(osp, "DataspaceWalletFailed")) == 1
+    assert ev(osp, "DataspaceWalletCreated") == []
+
+
 def test_wrong_did_is_checked_before_the_document(osp_factory, companies):
     # README 7.6 order: step 3 (DID form) before step 4 (document)
+    # OPEN-QUESTION: didDocument={"id": "x"} lacks fields that openapi marks `required` (see INVALID_DOCS): 204 expected
     osp = start(osp_factory)
     wrong = "did:web:other.example:BPNL0000000DIV01"
     assert send(osp, DIV, body(DIV, did=wrong, document={"id": "x"})).status_code == 204
@@ -553,3 +605,32 @@ def test_case_07_invalid_document_content_fails_at_once_without_further_attempts
     service().run_timer_once()
     assert row(DIV)["status"] == "FAILED" and len(ev(osp, "DataspaceWalletFailed")) == 1
     assert ev(osp, "DataspaceWalletCreated") == []
+
+
+# ------------------------------------------------------------------------ README 6.9 concurrent callbacks
+def test_two_concurrent_identical_callbacks_make_one_did_check_and_one_event(osp_factory, companies):
+    # README 6.9: callbacks for the same company never run at the same time; "same content: 204 without change"
+    osp = start(osp_factory)
+    token = div_token(osp)
+    barrier = threading.Barrier(2)
+    codes: list = []
+    errors: list = []
+
+    def work() -> None:
+        try:
+            barrier.wait(timeout=5)
+            codes.append(send(osp, DIV, body(DIV), token=token).status_code)
+        except BaseException as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=work) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=20)
+    assert not errors and codes == [204, 204]
+    service().run_timer_once()
+    service().run_timer_once()                       # a second pass would be a second check if one were left over
+    assert row(DIV)["status"] == "ACTIVE" and row(DIV)["attempt"] == 1
+    assert len(ev(osp, "DataspaceWalletCreated")) == 1 and ev(osp, "DataspaceWalletFailed") == []
+    assert m2().store().get_secret(row(DIV)["id"], "HOLDER_ACCESS")          # stored once, by the first callback

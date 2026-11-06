@@ -29,9 +29,11 @@ They are imported lazily, so a missing seam fails the single test that needs it.
 """
 from __future__ import annotations
 
+import datetime as dt
 import threading
 import uuid
 
+import httpx
 import pytest
 from test_c4_m2_common import (
     COMPANIES,
@@ -44,6 +46,8 @@ from test_c4_m2_common import (
     step_input,
     wallet_fake,  # noqa: F401 - fixture
 )
+
+from portal_common import http as phttp
 
 U1 = COMPANIES["u1"]["id"]
 U1_BPN = "BPNLIUK2REMLK3F4"
@@ -98,10 +102,15 @@ def assert_problem(r, status: int, name: str, retryable: bool | None = None) -> 
     return body
 
 
+def ts(minutes: int = 0) -> dt.datetime:
+    """Store rows hold tz-aware datetimes (TEAM3-PLAN 12.3: `service.now() -> datetime`)."""
+    return dt.datetime(2026, 11, 6, 9, 0, tzinfo=dt.UTC) + dt.timedelta(minutes=minutes)
+
+
 def put_row(company_key: str, ctype: str, status: str, attempt: int = 1, **fields) -> dict:
     """A credential row with the spec keys (README 5 `credential`), written through the store."""
     c = COMPANIES[company_key]
-    now = "2026-11-06T09:00:00Z"
+    now = ts(0)
     row = {"id": str(uuid.uuid4()), "company_id": c["id"], "credential_type": ctype, "status": status,
            "route": "STUB", "issuer_did": None, "wallet_provider": "STUB", "bpn": c["bpn"].upper(),
            "holder_did": f"did:web:wallet.example.org:{c['bpn']}", "request_ref": f"stub-{attempt}",
@@ -140,6 +149,7 @@ def test_case_01_issue_creates_two_requested_rows_and_orders(osp_factory, compan
         assert row["company_id"] == U1 and row["credential_type"] == t
         assert row["holder_did"] == f"did:web:wallet.example.org:{U1_BPN}"
         assert row["wallet_provider"] == "STUB"
+        assert not row["issuer_did"]                                # README 5: empty for CREDENTIAL_ISSUER and STUB
         assert row["requested_at"] and not row["issued_at"]
         assert history(U1, t) == [("REQUESTED", 1)]                 # README 6.1: every change writes history
     # README 11.6: the order remembers (company, credential type, BPN); both types ordered at the same time
@@ -289,6 +299,9 @@ def test_case_03_old_requested_row_is_resent_after_the_resend_age(osp_factory, c
     assert len(orders()) == 4
     assert [row_of(U1, t)["attempt"] for t in TYPES] == [2, 2]
     assert [row_of(U1, t)["request_ref"] for t in TYPES] == ["stub-2", "stub-2"]
+    # OPEN-QUESTION: README 6.1 lists no REQUESTED -> REQUESTED transition, yet "every change writes a row to
+    # credential_history" and 8.1 step 2 sends the order again with attempt + 1. Reading (ours): a resend is a
+    # change of the row and writes a history entry (REQUESTED, 2).
     assert history(U1, "BPN") == [("REQUESTED", 1), ("REQUESTED", 2)]
 
 
@@ -307,12 +320,10 @@ def test_case_03_resend_after_zero_hours_orders_again_with_attempt_two(osp_facto
 
 
 # ------------------------------------------------------------------------------------------ case 4
-def test_case_04_failing_type_fails_the_round_and_publishes_one_failure(osp_factory, companies, wallet_fake,
-                                                                        monkeypatch):
+def test_case_04_failing_type_fails_the_round_and_publishes_one_failure(osp_factory, companies, wallet_fake):
     # README 13 case 4, 6.2: BPN ISSUED, MEMBERSHIP FAILED, one CredentialIssuanceFailed, no CredentialsIssued
-    osp = osp_factory()
+    osp = osp_factory({"STUB_ISSUER_FAIL_TYPES": "MEMBERSHIP"})
     issue(osp, U1)
-    monkeypatch.setenv("STUB_ISSUER_FAIL_TYPES", "MEMBERSHIP")      # README 11.6: read when the timer fires
     flush()
     assert status_of(U1, "BPN") == "ISSUED"
     membership = row_of(U1, "MEMBERSHIP")
@@ -333,11 +344,10 @@ def test_case_04_failing_type_fails_the_round_and_publishes_one_failure(osp_fact
 def test_case_04_rerun_orders_only_the_failed_type_and_then_completes(osp_factory, companies, wallet_fake,
                                                                       monkeypatch):
     # README 13 case 4: empty the fail list, run again: only MEMBERSHIP is triggered; then CredentialsIssued
-    osp = osp_factory()
+    osp = osp_factory({"STUB_ISSUER_FAIL_TYPES": "MEMBERSHIP"})
     issue(osp, U1, 1)
-    monkeypatch.setenv("STUB_ISSUER_FAIL_TYPES", "MEMBERSHIP")
     flush()
-    monkeypatch.setenv("STUB_ISSUER_FAIL_TYPES", "")
+    monkeypatch.setenv("STUB_ISSUER_FAIL_TYPES", "")                # the spec's own wording: empty the list
     before = len(orders())
     r = issue(osp, U1, 2)
     assert r.status_code == 200, r.text
@@ -357,11 +367,10 @@ def test_case_04_rerun_orders_only_the_failed_type_and_then_completes(osp_factor
     assert history(U1, "MEMBERSHIP") == [("REQUESTED", 1), ("FAILED", 1), ("REQUESTED", 2), ("ISSUED", 2)]
 
 
-def test_case_04_fail_types_apply_to_every_listed_type(osp_factory, companies, wallet_fake, monkeypatch):
+def test_case_04_fail_types_apply_to_every_listed_type(osp_factory, companies, wallet_fake):
     # README 11.6: UNSUCCESSFUL for the types in STUB_ISSUER_FAIL_TYPES; both failing = two failure events
-    osp = osp_factory()
+    osp = osp_factory({"STUB_ISSUER_FAIL_TYPES": "BPN,MEMBERSHIP"})
     issue(osp, U1)
-    monkeypatch.setenv("STUB_ISSUER_FAIL_TYPES", "BPN,MEMBERSHIP")
     flush()
     assert [status_of(U1, t) for t in TYPES] == ["FAILED", "FAILED"]
     assert sorted(e["data"]["credentialType"] for e in osp.events("CredentialIssuanceFailed")) == TYPES
@@ -405,10 +414,23 @@ def test_case_05_missing_wallet_is_wallet_not_ready(osp_factory, companies, wall
 
 def test_case_05_bring_your_own_wallet_has_no_issuer_route(osp_factory, companies, wallet_fake):
     # README 13 case 5, 6.3 "own wallet has no route in 0.2": 409 no-issuer-route, retryable false, no row
+    # OPEN-QUESTION: README 6.3 rule 2 (OWN + empty ISSUER_ROUTES => STUB) contradicts case 5 (BRING_YOUR_OWN =>
+    # 409 no-issuer-route) for this default configuration. Case 5 wins: the issuance mode CREDENTIAL_OFFER is
+    # rejected BEFORE rule 2 is applied (6.3 last paragraph: "an own wallet has no route in version 0.2").
     osp = osp_factory()
     assert_problem(issue(osp, cid("u7_byo")), 409, "no-issuer-route", retryable=False)
     no_rows_created(cid("u7_byo"))
     assert orders() == []
+
+
+def test_case_05_bring_your_own_wallet_has_no_route_with_a_configured_issuer_routes(osp_factory, companies,
+                                                                                    wallet_fake):
+    # README 6.3 last paragraph: with a non-empty ISSUER_ROUTES there is no entry for BRING_YOUR_OWN either
+    # (rule 2: provider without entry -> 409 no-issuer-route); same answer as in the default configuration
+    osp = osp_factory({"ISSUER_ROUTES": "SAP_DIV:CREDENTIAL_ISSUER,IDENTITY_HUB:ISSUER_SERVICE,CSP:ISSUER_SERVICE"})
+    assert_problem(issue(osp, cid("u7_byo")), 409, "no-issuer-route", retryable=False)
+    no_rows_created(cid("u7_byo"))
+    assert orders() == [] and wallet_fake.holder_access_calls == []
 
 
 def test_case_05_unknown_company_is_not_ready(osp_factory, companies, wallet_fake):
@@ -429,6 +451,7 @@ def test_case_05_company_is_checked_before_the_wallet(osp_factory, companies, wa
 
 def test_case_05_wallet_is_checked_before_the_route(osp_factory, companies, wallet_fake):
     # README 8.1 Preconditions order: wallet before route. A BYO wallet that is not ACTIVE is wallet-not-ready.
+    # OPEN-QUESTION: see test_case_05_bring_your_own_wallet_has_no_issuer_route (CREDENTIAL_OFFER rejected before rule 2).
     osp = osp_factory()
     wallet_fake.set("u7_byo", status="REQUESTED")
     assert_problem(issue(osp, cid("u7_byo")), 409, "wallet-not-ready", retryable=False)
@@ -495,7 +518,7 @@ def test_case_17_reactivation_with_active_company_status_is_accepted(osp_factory
 def test_case_17_cancelled_and_failed_rows_are_ordered_again(osp_factory, companies, wallet_fake):
     # README 6.1 first row / 8.1 step 2: FAILED, CANCELLED, REVOKED -> REQUESTED with attempt + 1
     osp = osp_factory()
-    put_row("u1", "BPN", "ISSUED", 1, issued_at="2026-11-06T09:01:00Z")
+    put_row("u1", "BPN", "ISSUED", 1, issued_at=ts(1))
     put_row("u1", "MEMBERSHIP", "CANCELLED", 3)
     r = issue(osp, U1)
     assert r.json()["state"] == "RUNNING"
@@ -510,6 +533,117 @@ def test_case_18_inactive_company_gets_no_credentials(osp_factory, companies, wa
     assert_problem(issue(osp, cid("u5")), 409, "company-not-ready", retryable=False)
     no_rows_created(cid("u5"))
     assert orders() == []
+
+
+# ------------------------------------------------------------------------------------ README 8.1 step 5
+@pytest.mark.parametrize("run_status", ["FAILED", None])
+def test_readme_8_1_step_5_all_issued_with_failed_or_missing_run_is_done_without_event(
+        osp_factory, companies, wallet_fake, run_status):
+    # README 8.1 step 5: "All types ISSUED: DONE, without an event (there already was one, or the types were
+    # issued before)". The run row is FAILED (late reports issued everything) or missing altogether.
+    osp = osp_factory()
+    for t in TYPES:
+        put_row("u1", t, "ISSUED", 1, issued_at=ts(1))
+    if run_status:
+        store().put_run({"company_id": U1, "credential_types": TYPES, "status": run_status,
+                         "process_id": step_input(U1)["processId"], "step_run_id": step_input(U1)["stepRunId"],
+                         "started_at": ts(0), "finished_at": ts(2)})
+    r = issue(osp, U1, 5)
+    assert r.status_code == 200, r.text
+    assert r.json()["state"] == "DONE"
+    assert store().get_run(U1)["status"] == "DONE"
+    assert osp.events("CredentialsIssued") == [] and osp.events("CredentialIssuanceFailed") == []
+    assert orders() == []
+    assert [row_of(U1, t)["attempt"] for t in TYPES] == [1, 1]
+
+
+def test_readme_8_1_note_reactivation_without_credential_types_names_both_types(osp_factory, companies, wallet_fake):
+    # README 8.1 Input note: "Without it, the result would be the same, because the issued BPN credential is not
+    # triggered again; but CredentialsIssued would then name both types." Documented behaviour, not a recommendation.
+    osp = osp_factory()
+    put_row("u1", "BPN", "ISSUED", 1, issued_at=ts(1))
+    put_row("u1", "MEMBERSHIP", "REVOKED", 1, issued_at=ts(1), revoked_at=ts(3), revocation_reason="COMPANY_DEACTIVATED")
+    companies.set_status(U1, "ACTIVE")
+    assert issue(osp, U1).json()["state"] == "RUNNING"
+    assert orders() == [{"company_id": U1, "credential_type": "MEMBERSHIP", "bpn": U1_BPN, "attempt": 2}]
+    assert row_of(U1, "BPN")["attempt"] == 1 and status_of(U1, "BPN") == "ISSUED"
+    assert store().get_run(U1)["credential_types"] == TYPES
+    flush()
+    evs = osp.events("CredentialsIssued")
+    assert len(evs) == 1 and evs[0]["data"] == {"companyId": U1, "credentialTypes": TYPES}
+
+
+# --------------------------------------------------------------------------- README 11.1, 11.2, 12, 8.1
+def test_readme_11_1_company_query_failing_is_502_upstream_error_retryable(osp_factory, companies, wallet_fake,
+                                                                           monkeypatch):
+    # README 11.1 / 12: C3-M1 did not respond as expected (not a 404) -> 502 upstream-error, retryable true
+    osp = osp_factory()
+
+    def broken(**_kw):
+        raise RuntimeError("C3-M1 is down")
+
+    monkeypatch.setattr("modules.c3_m1.interface.query_company", broken)
+    assert_problem(issue(osp, U1), 502, "upstream-error", retryable=True)
+    no_rows_created(U1)
+    assert orders() == []
+
+
+def test_readme_11_2_wallet_query_failing_is_502_upstream_error_retryable(osp_factory, companies, wallet_fake,
+                                                                          monkeypatch):
+    # README 11.2 / 12: C4-M2 did not respond as expected (not a 404) -> 502 upstream-error, retryable true
+    osp = osp_factory()
+
+    def broken(**_kw):
+        raise RuntimeError("C4-M2 is down")
+
+    monkeypatch.setattr("modules.c4_m2.interface.get_wallet_info", broken)
+    assert_problem(issue(osp, U1), 502, "upstream-error", retryable=True)
+    no_rows_created(U1)
+    assert orders() == []
+
+
+@pytest.mark.parametrize("company_id", ["not-a-uuid", "12345", ""])
+def test_readme_8_1_company_id_must_be_a_uuid(osp_factory, companies, wallet_fake, company_id):
+    # README 8.1 Input companyId; openapi format uuid -> 400 validation (README 12), retryable false
+    osp = osp_factory()
+    assert_problem(issue(osp, company_id), 400, "validation", retryable=False)
+    assert orders() == []
+
+
+def test_readme_8_1_credential_issuer_route_needs_the_did_document_location(osp_factory, companies, wallet_fake,
+                                                                            monkeypatch):
+    # README 8.1 Preconditions C4-M2: "for the route CREDENTIAL_ISSUER also with the location of the DID document.
+    # Otherwise 409 wallet-not-ready" - before any call (no holder access, no call to the issuer), no row
+    calls: list[str] = []
+
+    def record(method, url, *a, **kw):
+        calls.append(url)
+        return httpx.Response(200, json={"access_token": "t", "expires_in": 300}, request=httpx.Request(method, url))
+
+    osp = osp_factory({"ISSUER_MODE": "OWN", "ISSUER_ROUTES": "SAP_DIV:CREDENTIAL_ISSUER",
+                       "CREDENTIAL_ISSUER_URL": "http://cred-issuer.test",
+                       "CREDENTIAL_ISSUER_TOKEN_URL": "http://cred-issuer.test/token",
+                       "CREDENTIAL_ISSUER_CLIENT_ID": "m1", "CREDENTIAL_ISSUER_CLIENT_SECRET": "s",
+                       "CALLBACK_BASE_URL": "http://osp.test"})
+    monkeypatch.setattr(phttp, "request", record)
+    wallet_fake.set("u4", didDocumentLocation=None)
+    assert_problem(issue(osp, cid("u4")), 409, "wallet-not-ready", retryable=False)
+    no_rows_created(cid("u4"))
+    assert wallet_fake.holder_access_calls == []
+    assert [u for u in calls if u.startswith("http://cred-issuer.test")] == []
+
+
+# ------------------------------------------------------------------------------ README 12.3: interface.reset
+def test_interface_reset_cancels_pending_stub_timers_and_empties_the_store(osp_factory, companies, wallet_fake):
+    # TEAM3-PLAN 12.3: `interface.reset()` clears the store, cancels pending STUB timers, clears the routes state
+    osp = osp_factory()
+    issue(osp, U1)
+    assert len(orders()) == 2                                       # two timers are pending
+    seam("modules.c4_m1.interface").reset()
+    flush()                                                         # nothing is left to fire
+    assert store().list_credentials() == [] and store().get_run(U1) is None
+    assert orders() == []
+    assert osp.events("CredentialsIssued") == [] and osp.events("CredentialIssuanceFailed") == []
 
 
 # ------------------------------------------------------------------------------------ README 8.1 step 2

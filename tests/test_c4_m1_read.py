@@ -170,8 +170,11 @@ def test_case_08_other_company_is_404_not_found(osp_factory, companies):
 
 def test_case_08_person_without_company_id_is_404(osp_factory, companies):
     # README 6.5: "otherwise 404 not-found, also if the token has no company_id".
-    # OPEN-QUESTION: README 14 names P3 as portal role `Applicant`, which has no view_credentials, so the
-    # permission check (403) would come first; P3 therefore carries `Company Admin` but no company_id here.
+    # OPEN-QUESTION (spec inconsistency, case 8 vs 6.5 order): README 13 case 8 expects 404 for "Person P3 without
+    # company_id", and README 14 makes P3 a person of portal role `Applicant`, which has no view_credentials; but 6.5
+    # fixes the order token (401), permission (403), company scope (404), so P3 as defined would get 403. We follow
+    # 6.5: P3 carries `Company Admin` (permission present) but no company_id -> 404; the 403 of the real P3 is
+    # asserted in test_case_08_permission_is_checked_before_company_scope.
     osp = osp_factory()
     token = osp.person("p3-no-company", ["Company Admin"], company_id=None)
     r = osp.get(f"{P}/companies/{U1['id']}/credentials", token)

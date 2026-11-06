@@ -75,6 +75,8 @@ def wallet_events(osp):
 
 
 def wallet_orders():
+    # OPEN-QUESTION: the shape of providers.orders() (`provider`, `bpn`, `kind`) is the TEAM3-PLAN 12.2 convention,
+    # not README text; the README only says "no second order to the stand-in".
     return [(o["provider"], o["bpn"], o["kind"]) for o in seam("modules.c4_m2.providers").orders()]
 
 
@@ -144,7 +146,7 @@ def test_case_08_builtin_csp_standin_wallet_active_within_the_call(osp_factory, 
     assert schema_errors("c4-m2", "StepResultWallet", body) == []
     res = body["result"]
     assert (res["companyId"], res["provider"]) == (COMPANIES["csp"]["id"], "CSP")
-    assert res["status"] in ("VALIDATING", "ACTIVE")                            # OPEN-QUESTION: status at reply time
+    assert res["status"] == "ACTIVE"                                            # README 8.1 step 5: ACTIVE within this call
     w = info("csp")
     assert (w["status"], w["did"], w["provider"], w["issuanceMode"]) == ("ACTIVE", CSP_DID, "CSP", "HOLDER_REQUESTS")
     assert w["didDocumentLocation"] == "https://csp-wallet.example.org/BPNLIUK2REMLK3F4/did.json"
@@ -239,11 +241,18 @@ def test_case_08_shared_csp_standin_token_wallet_did_resolution(osp_factory, com
     # token with private_key_jwt: assertion iss = sub = ospId from SETTINGS_FILE (README 4, 13 case 8)
     tokens = [kw for m, u, kw in spy.calls if m == "POST" and u == CSP_URL + "/oauth/token"]
     assert tokens, "the module fetched no token at the CSP"
+    # OPEN-QUESTION: `kw["data"]`, `kw["json"]` and `kw["headers"]` of portal_common.http.request are how this
+    # test reads the form, body and Authorization header; the README does not fix how the adapter calls the client.
     form = tokens[0]["data"]
     assert form["grant_type"] == "client_credentials"
     assert form["client_assertion_type"] == "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
     claims = jwt.decode(form["client_assertion"], options={"verify_signature": False})
     assert claims["iss"] == claims["sub"] == OSP_A_ID
+    assert claims["aud"] == CSP_URL + "/oauth/token"            # RFC 7523: the audience is the token endpoint
+    assert claims.get("exp") and claims.get("jti")              # OPEN-QUESTION: exp/jti are RFC 7523 practice, not README text
+    # signed with the key of the OSP (the stand-in verifies it against the trust list; checked here too)
+    pub = json.loads(osp.tmp_path.joinpath("trust.json").read_text())[OSP_A_ID]["jwk"]
+    jwt.decode(form["client_assertion"], jwt.PyJWK(pub).key, algorithms=["ES256"], options={"verify_aud": False})
     # README 11.3: POST /wallets with the BPN, with the access token of the CSP
     posts = [kw for m, u, kw in spy.calls if m == "POST" and u == CSP_URL + "/wallet/v1/wallets"]
     assert len(posts) == 1 and posts[0]["json"] == {"bpn": CSP_BPN}
@@ -437,7 +446,39 @@ def test_case_25_shared_csp_standin_api_key_appears_nowhere(osp_factory, compani
         assert_no_secret(secret, *_all_haystacks(osp, caplog, ["csp"]), result)
 
 
-def test_case_25_failed_orders_do_not_log_secrets_either(osp_factory, companies, caplog):
+def test_case_25_failed_orders_do_not_log_secrets_either(osp_factory, companies, caplog, monkeypatch):
+    # README 13 case 25, 4, 6.7: a SAP DIV callback that carries a secret but fails (invalid document), then a
+    # re-order that fails technically (503 -> 502): the secret of the callback and the key are in no log, event,
+    # audit entry, step_log, table dump or response.
+    caplog.set_level(logging.DEBUG)
+    secret = "callback-secret-9f8e7d6c5b4a-do-not-leak"
+    bpn = COMPANIES["div"]["bpn"]
+    osp = osp_factory(env={"STUB_CALLBACK_DELAY_SECONDS": "3600"})
+    first = create(osp, "div", "SAP_DIV")
+    assert first.status_code == 200, first.text
+    did = "did:web:div.example.org:did:" + bpn
+    bad_document = {"@context": ["https://www.w3.org/ns/did/v1"], "id": did,
+                    "service": [{"id": did + "#cs", "type": "CredentialService", "serviceEndpoint": "https://x.example/cs"}]}
+    callback = osp.post(f"/api/c4-m2/callbacks/sap-div/wallets/{bpn}",
+                        osp.service("sa-div-callback", ["submit_wallet_callback"]),
+                        json={"did": did, "didDocument": bad_document,
+                              "authenticationDetails": {"authenticationServiceUrl": "https://auth.div.example.org/oauth",
+                                                        "clientID": "div-client-7", "clientSecret": secret}})
+    assert callback.status_code == 204, callback.text
+    assert info("div")["status"] == "FAILED"                                      # no verificationMethod (README 7.6 step 4)
+    monkeypatch.setenv("STUB_FAILURES", f"{bpn}:ORDER_ERROR")
+    again = create(osp, "div", "SAP_DIV", n=2)
+    assert again.status_code == 502, again.text
+    assert row("div")["attempt"] == 2 and row("div").get("provider_ordered_at") is None
+    store = seam("modules.c4_m2.interface").store()
+    assert store.list_audit() and store.list_step_log()                           # the scan is not vacuous
+    hay = [caplog.text, osp.events(), store.list_audit(), store.list_step_log(), json.dumps(store.dump(), sort_keys=True),
+           first.text, callback.text, again.text]
+    assert_no_secret(secret, *hay)
+    assert_no_secret(SECRETS_KEY_HEX, *hay)
+
+
+def test_case_25_failed_ih_order_does_not_log_the_key(osp_factory, companies, caplog):
     caplog.set_level(logging.DEBUG)
     osp = osp_factory(env={"STUB_FAILURES": f"{IH_BPN}:ORDER_ERROR"})
     r = create(osp, "ih", "IDENTITY_HUB")
@@ -767,3 +808,69 @@ def test_wallet_orders_do_not_include_account_orders(osp_factory, companies):
     create(osp, "ih", "IDENTITY_HUB")
     create(osp, "csp", "CSP", n=2)
     assert {o["kind"] for o in seam("modules.c4_m2.providers").orders()} == {"wallet"}
+
+
+# ============================================================== README 6.4 step 1 end to end: CSP DID form
+def _csp_wallet_answer(did, calls=None):
+    """A recording fake of the wallet API of the CSP: `POST /wallets` answers 201 with `did`; the token goes through."""
+    def handler(method, url, kw):
+        if method == "POST" and url == CSP_URL + "/wallet/v1/wallets":
+            return httpx.Response(201, json={"participantContextId": "pc-fake", "did": did,
+                                             "credentialServiceUrl": "https://fake.example.org/cs",
+                                             "identityApiUrl": CSP_URL + "/identity/v1", "apiKey": "fake-api-key-0123456789"})
+        return None
+    return handler
+
+
+@pytest.mark.parametrize("did", ["did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK", "did:ion:EiClkZMDxPKqC9c",
+                                 "https://csp-wallet.example.org/did.json"])
+def test_csp_did_that_is_not_did_web_ends_failed_did_mismatch(osp_factory, companies, monkeypatch, did):
+    # README 6.4 step 1: "Dataspace wallet of the CSP: only the form did:web: is checked" -> FAILED, DID_MISMATCH,
+    # event DataspaceWalletFailed (6.2), before any resolution
+    spy = Spy(monkeypatch, _csp_wallet_answer(did))
+    osp = osp_factory(env=SHARED_CSP_ENV, csp=True)
+    osp.csp_register(CSP_BPN)
+    r = create(osp, "csp", "CSP")
+    assert r.status_code == 200 and r.json()["state"] == "RUNNING", r.text
+    seam("modules.c4_m2.service").run_timer_once()
+    w = info("csp")
+    assert (w["status"], w["failureReason"]) == ("FAILED", "DID_MISMATCH")
+    events = wallet_events(osp)
+    assert [e["type"] for e in events] == ["DataspaceWalletFailed"] and event_errors("c4-m2", events[0]) == []
+    assert events[0]["data"] == {"companyId": COMPANIES["csp"]["id"], "walletId": w["walletId"], "provider": "CSP",
+                                 "reason": "DID_MISMATCH"}
+    assert spy.to("/1.0/identifiers/") == [] and spy.to("did.json") == []        # form is checked before resolution
+
+
+# ===================================================================== README 11.4: did:web URL rules, HTTPS
+def test_builtin_resolution_of_a_host_only_did_uses_well_known_did_json(osp_factory, companies, monkeypatch):
+    # README 11.4: "https://<host>/.well-known/did.json per the did:web method" for a DID without path
+    did = "did:web:host-only.example.org"
+    requests = []
+    app = FastAPI()
+
+    @app.get("/.well-known/did.json")
+    def well_known():
+        requests.append("well-known")
+        return doc(did, service="https://host-only.example.org/cs")
+
+    phttp.register_local("https://host-only.example.org", app)
+    spy = Spy(monkeypatch, _csp_wallet_answer(did))
+    osp = osp_factory(env={"CSP_WALLET_URL": CSP_URL + "/wallet/v1"}, csp=True)      # DID_RESOLVER_URL empty
+    osp.csp_register(CSP_BPN)
+    assert create(osp, "csp", "CSP").status_code == 200
+    assert spy.to("did.json", "GET") == [("GET", "https://host-only.example.org/.well-known/did.json")]
+    assert requests == ["well-known"]
+    w = info("csp")
+    assert w["status"] == "ACTIVE" and w["did"] == did and w["credentialServiceUrl"] == "https://host-only.example.org/cs"
+
+
+def test_builtin_resolution_fetches_only_https_urls(osp_factory, companies, monkeypatch):
+    # README 11.4: "HTTPS only": whatever the DID is, no http:// URL is requested for the document
+    spy = Spy(monkeypatch, _csp_wallet_answer("did:web:host-only.example.org"))
+    osp = osp_factory(env={"CSP_WALLET_URL": CSP_URL + "/wallet/v1"}, csp=True)
+    osp.csp_register(CSP_BPN)
+    create(osp, "csp", "CSP")
+    fetched = [u for m, u in spy.to("did.json", "GET")]
+    assert fetched and all(u.startswith("https://") for u in fetched)
+    assert not [u for _, u, _ in spy.calls if u.startswith("http://") and "did.json" in u]

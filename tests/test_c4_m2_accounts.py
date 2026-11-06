@@ -39,6 +39,17 @@ OPEN-QUESTION: create-wallet-account for a company without any wallet row: READM
 OPEN-QUESTION: "the CSP stand-in no longer knows the account" (case 20) is observed through the
 `account-deletion` order in `providers.orders()` and through the 409-then-recreate path (README 8.2), because
 the stand-in has no other public read seam.
+OPEN-QUESTION: README 5 (table `wallet_account`, `provider_name`) says `tu-` + technical_user_id for SAP DIV and CSP
+only; 8.2 step 3 sets it for every account. The tests follow 8.2 (every provider, IdentityHub too).
+OPEN-QUESTION: README 8.3 step 3 / 6.9 do not say whether deleting a FAILED account answers RUNNING (the object was
+not complete at the call) or DONE; the test of that case does not assert the step state, only the account and event.
+OPEN-QUESTION: README 8.3 gives the `walletAccountRef` conflict in the Input paragraph and the REQUESTED precondition
+under Preconditions; when both apply the tests assert preconditions first (invalid-state), then the conflict.
+OPEN-QUESTION: credentials_state of an account that became DELETED without retrieval: README 6.3 only deletes the
+row, 6.7 names no transition, so the tests expect the value to stay as it was (AVAILABLE).
+
+Time: `expires_at`, `provider_ordered_at`, `deletion_ordered_at` and the other timestamps must come from
+`service.now()` at call time (never from import time or `datetime.now()` directly), so that the kit `Clock` drives them.
 """
 from __future__ import annotations
 
@@ -48,10 +59,13 @@ import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 
+import httpx
 import pytest
 
+from portal_common import http as phttp
 from portal_common import problems
-from test_c4_m2_common import (COMPANIES, Clock, assert_no_secret, companies, event_errors, osp_factory,  # noqa: F401
+from tools import test_iam
+from test_c4_m2_common import (COMPANIES, CSP_URL, Clock, assert_no_secret, companies, event_errors, osp_factory,  # noqa: F401
                                response_errors, schema_errors, seam, step_input, uuid_str)
 
 MODULE = "c4-m2"
@@ -276,11 +290,12 @@ def test_case_16_company_without_any_wallet_is_409_wallet_not_active(osp_factory
 def test_case_17_deactivated_company_gets_no_account_but_can_delete(osp_factory, companies):
     # README 13 case 17, 8.2 preconditions, 8.3 "status of the company does not matter", 6.3 deactivated company
     osp = osp_factory(env=ENV)
-    make_wallet(INA, "SAP_DIV")                       # wallet while the company is still ACTIVE
+    companies.set_status(INA["id"], "ACTIVE")         # the kit lists INA as INACTIVE; here it starts ACTIVE
+    make_wallet(INA, "SAP_DIV")                       # wallet ACTIVE while the company is still active
     create(INA, 1)
     providers().flush_stand_in()
     assert acct(1)["status"] == "ACTIVE"
-    companies.set_status(INA["id"], "INACTIVE")
+    companies.set_status(INA["id"], "INACTIVE")       # then the company is deactivated
 
     assert_problem(step_problem(m2().create_wallet_account, INA, 2), 409, "company-not-active", retryable=False)
     assert acct(2) is None and len(account_orders("account")) == 1
@@ -305,6 +320,7 @@ def test_case_19_identityhub_two_users_active_with_the_same_sts_client_id(osp_fa
     for n, out in zip((1, 2), outs):
         assert_account_result(out, n, IH, "RUNNING", "IDENTITY_HUB", "ACTIVE")      # ACTIVE within the call
         assert acct(n)["status"] == "ACTIVE" and acct(n)["credentials_state"] == "AVAILABLE"
+        # OPEN-QUESTION: README 5 table lists `tu-` only for SAP DIV and CSP; 8.2 step 3 sets it for every account
         assert acct(n)["provider_name"] == f"tu-{tu(n)}"
     c1, c2 = creds(1), creds(2)
     assert c1["client_id"] == c2["client_id"] == sts["client_id"]
@@ -387,8 +403,14 @@ def test_case_20_csp_409_account_exists_deletes_and_creates_again(osp_factory, c
     out = m2().create_wallet_account(step_input(CSPC["id"], next(_steps), technicalUserId=tu(1)))   # re-order (8.2 step 1)
     assert out["state"] == "RUNNING" and acct(1)["id"] == ref
     assert acct(1)["status"] == "ACTIVE" and acct(1)["provider_ordered_at"] and creds(1)["token_url"] == CSP_TOKEN_URL
-    assert [o["external_id"] for o in account_orders("account-deletion")] == [ref]
-    assert [o["external_id"] for o in account_orders("account")] == [ref, ref]
+    # how a stand-in records a rejected (409) order is its own business: only the sequence of kinds for `ref` counts
+    orders = [o for o in account_orders() if o["external_id"] == ref]
+    kinds = [o["kind"] for o in orders]
+    assert kinds.count("account") >= 2 and "account-deletion" in kinds, kinds
+    first = kinds.index("account")
+    last = len(kinds) - 1 - kinds[::-1].index("account")
+    assert first < kinds.index("account-deletion") < last, kinds       # delete between the first and the last order
+    assert orders[-1]["kind"] == "account" and orders[-1]["external_id"] == ref
 
 
 def test_case_20_csp_technical_error_is_502_and_account_stays_requested(osp_factory, companies, monkeypatch):
@@ -461,7 +483,8 @@ def test_case_21_delete_without_deletion_callback_fails_after_the_deadline(osp_f
     failed = evs(osp, "WalletAccountDeletionFailed", 1)
     assert len(failed) == 1 and event_errors(MODULE, failed[0]) == []
     d = failed[0]["data"]
-    assert (d["technicalUserId"], d["companyId"], d["walletAccountRef"]) == (tu(1), DIV["id"], ref) and d["reason"]
+    assert (d["technicalUserId"], d["companyId"], d["walletAccountRef"]) == (tu(1), DIV["id"], ref)
+    assert d["reason"] == "PROVIDER_TIMEOUT"                        # openapi EventWalletAccountDeletionFailed
     assert evs(osp, "WalletAccountDeleted") == []
 
 
@@ -663,7 +686,8 @@ def test_current_account_is_the_row_not_deleted_else_the_latest(osp_factory, com
     p1 = person(osp, "p1-ih", IH)
     r = osp.get(_VIEW.format(tu(1)), p1)                 # only a DELETED row: the latest
     assert r.status_code == 200 and r.json()["status"] == "DELETED" and r.json()["walletAccountRef"] == first
-    assert r.json()["credentialsState"] in ("NONE", "AVAILABLE", "RETRIEVED", "EXPIRED")
+    # OPEN-QUESTION (module docstring): README 6.3 deletes only the credentials row, 6.7 names no state change
+    assert r.json()["credentialsState"] == "AVAILABLE" and r.json()["credentialsExpireAt"] is None
     create(IH, 1)                                        # new account after DELETED
     second = acct(1)["id"]
     assert second != first and acct(1)["status"] == "ACTIVE"
@@ -785,6 +809,7 @@ def test_delete_for_another_company_is_409_conflict(osp_factory, companies):
 
 def test_delete_failed_account_becomes_deleted_with_event(osp_factory, companies, monkeypatch):
     # README 8.3 step 3, 6.3 `FAILED` -> `DELETED`
+    # OPEN-QUESTION (module docstring): 6.9 does not say RUNNING or DONE for this case, so the step state is not asserted
     osp = osp_factory(env={**ENV, "STUB_FAILURES": f"{tu(1)}:NO_CALLBACK"})
     clock = Clock().install(monkeypatch, "modules.c4_m2.service")
     make_wallet(DIV, "SAP_DIV")
@@ -857,7 +882,9 @@ def test_create_callback_stores_encrypted_credentials_and_activates(osp_factory,
     ev = evs(osp, "WalletAccountCreated", 1)
     assert len(ev) == 1 and ev[0]["data"]["walletAccountRef"] == ref and event_errors(MODULE, ev[0]) == []
     audit = [e for e in store().list_audit() if e["azp"] == "sa-div-callback"]
-    assert audit and audit[-1]["company_id"] == DIV["id"]            # README 7.6 audit entry with azp
+    # README 7.6: audit entry with azp; README 5: company_id is the caller's token claim, a service account has none
+    assert audit and audit[-1]["azp"] == "sa-div-callback" and audit[-1]["sub"] == "service-account-sa-div-callback"
+    assert audit[-1]["object_id"] == ref
 
 
 def test_create_callback_repeated_on_active_is_204_without_change(osp_factory, companies):
@@ -872,8 +899,8 @@ def test_create_callback_repeated_on_active_is_204_without_change(osp_factory, c
     assert len([e for e in store().list_audit() if e["azp"] == "sa-div-callback"]) >= 2   # every callback is audited
 
 
-def test_create_callback_in_other_states_is_409_invalid_state(osp_factory, companies, monkeypatch):
-    # README 7.6 create step 2 `FAILED`, `DELETING`, `DELETED`
+def accounts_in_other_states(osp_factory, monkeypatch):
+    """SAP DIV accounts: 1 FAILED, 2 DELETING (credentials row still there), 3 DELETED."""
     osp = osp_factory(env={**ENV, "STUB_FAILURES": f"{tu(1)}:NO_CALLBACK"})
     clock = Clock().install(monkeypatch, "modules.c4_m2.service")
     make_wallet(DIV, "SAP_DIV")
@@ -885,14 +912,38 @@ def test_create_callback_in_other_states_is_409_invalid_state(osp_factory, compa
     service().run_timer_once()
     assert (acct(1)["status"], acct(2)["status"]) == ("FAILED", "ACTIVE")
     delete(DIV, 2)                                           # DELETING (callback pending in the stand-in)
-    assert acct(2)["status"] == "DELETING"
+    assert acct(2)["status"] == "DELETING" and creds(2) is not None
     delete(DIV, 3)
     cb_delete(osp, acct(3)["id"])                            # DELETED
     assert acct(3)["status"] == "DELETED"
+    return osp
+
+
+def test_create_callback_in_other_states_is_409_invalid_state(osp_factory, companies, monkeypatch):
+    # README 7.6 create step 2 `FAILED`, `DELETING`, `DELETED`; 6.3: the credentials row is deleted only on the
+    # transition to DELETED, so a DELETING account keeps its row (and credentials_state) unchanged
+    osp = accounts_in_other_states(osp_factory, monkeypatch)
+    row2, state2 = dict(creds(2)), acct(2)["credentials_state"]
     for n, state in ((1, "FAILED"), (2, "DELETING"), (3, "DELETED")):
         r = cb_create(osp, acct(n)["id"])
         assert r.status_code == 409 and ptype(r) == "urn:c4-m2:problem:invalid-state", (n, r.text)
-        assert acct(n)["status"] == state and creds(n) is None
+        assert acct(n)["status"] == state
+        if state == "DELETING":
+            assert creds(n) == row2 and acct(n)["credentials_state"] == state2
+        else:
+            assert creds(n) is None
+
+
+def test_case_15_retrieval_for_failed_deleting_deleted_account_is_409_invalid_state(osp_factory, companies, monkeypatch):
+    # README 7.3 step 2 "Status not ACTIVE: 409 invalid-state" (the status is checked before credentials_state)
+    osp = accounts_in_other_states(osp_factory, monkeypatch)
+    token = person(osp, "p1-div", DIV)
+    row2 = dict(creds(2))
+    for n, state in ((1, "FAILED"), (2, "DELETING"), (3, "DELETED")):
+        r = retrieve(osp, token, n)
+        assert r.status_code == 409 and ptype(r) == "urn:c4-m2:problem:invalid-state", (n, r.text)
+        assert "clientSecret" not in r.text and acct(n)["status"] == state
+    assert creds(2) == row2 and acct(2)["credentials_state"] == "AVAILABLE"       # nothing was consumed
 
 
 def test_delete_callback_deletes_the_account_and_its_credentials(osp_factory, companies):
@@ -918,10 +969,14 @@ def test_delete_callback_for_an_account_that_is_not_deleting_is_409(osp_factory,
 
 
 # --------------------------------------------------------------------------------- case 25 (accounts)
-def _secret_scan(osp, caplog, secrets: list[str]) -> None:
+def _secret_scan(osp, caplog, secrets: list[str], client_ids: list[str]) -> None:
+    # README 5: `client_id` is stored as plain text, so the table dump is scanned for client SECRETS only;
+    # README 13 case 14: client IDs and secrets appear in no event, step result, step_log, audit_log or log
     dump = store().dump()
     for s in secrets:
         assert_no_secret(s, caplog.text, [e for e in osp.events()], store().list_audit(), store().list_step_log(), dump)
+    for c in client_ids:
+        assert_no_secret(c, caplog.text, [e for e in osp.events()], store().list_audit(), store().list_step_log())
 
 
 @pytest.mark.parametrize("provider", ["SAP_DIV", "IDENTITY_HUB", "CSP"])
@@ -936,17 +991,16 @@ def test_case_25_account_secrets_appear_nowhere_in_plaintext(osp_factory, compan
         assert cb_create(osp, acct(1)["id"]).status_code == 204
     assert acct(1)["status"] == "ACTIVE"
     outs.append(delete(company, 7))                                   # a step without account
-    secrets = [plain_secret(1), creds(1)["client_id"]]
+    secrets, client_ids = [plain_secret(1)], [creds(1)["client_id"]]
     if provider == "IDENTITY_HUB":
         sts = store().get_secret(w["id"], "STS_ACCESS")
         secrets.append(seam("modules.c4_m2.crypto").decrypt(sts["secret_encrypted"], sts["nonce"], sts["key_version"]))
-    for s in secrets:
+    for s in secrets + client_ids:
         assert_no_secret(s, outs)
-    _secret_scan(osp, caplog, secrets)
+    _secret_scan(osp, caplog, secrets, client_ids)
     r = retrieve(osp, person(osp, "p1-any", company), 1)             # the one place that hands the secret out
     assert r.status_code == 200 and r.json()["clientSecret"] == secrets[0]
-    _secret_scan(osp, caplog, secrets)
-    assert_no_secret(secrets[0], store().dump())
+    _secret_scan(osp, caplog, secrets, client_ids)
 
 
 # --------------------------------------------------------------- event contract for other teams
@@ -980,3 +1034,236 @@ def test_events_for_notifications_and_c2_m3_carry_technicalUserId_companyId_wall
     assert osp.events("WalletAccountFailed")[0]["data"]["reason"] == "PROVIDER_TIMEOUT"
     assert osp.events("WalletAccountDeleted")[0]["data"]["technicalUserId"] == tu(2)
     assert osp.events("WalletAccountDeletionFailed")[0]["data"]["technicalUserId"] == tu(3)
+
+
+# ------------------------------------------------- README 7.2 / 7.3 / 6.8: who may see and retrieve
+def test_person_with_permission_but_without_company_id_gets_404(osp_factory, companies):
+    # README 7.2 step 2 / 7.3 step 1: `company_id` of the account not equal to `company_id` in the token (here: none) -> 404
+    osp = csp_account(osp_factory)
+    token = person(osp, "p5-admin-unbound", None, roles=("IT Admin",))      # permission yes, company binding no
+    r = osp.get(_VIEW.format(tu(1)), token)
+    assert r.status_code == 404 and ptype(r) == "urn:c4-m2:problem:not-found"
+    r = retrieve(osp, token, 1)
+    assert r.status_code == 404 and ptype(r) == "urn:c4-m2:problem:not-found"
+    assert "clientSecret" not in r.text
+    assert creds(1) is not None and acct(1)["credentials_state"] == "AVAILABLE"        # nothing was consumed
+
+
+def test_view_permission_alone_does_not_allow_retrieving_credentials(osp_factory, companies):
+    # README 6.8: credentials POST needs `retrieve_wallet_credentials`; `view_dataspace_wallet` is not enough.
+    # No stock role has only the view permission, so the test adds a role to the in-memory test IAM
+    # (a person token is the only kind the route accepts: scope `company`).
+    osp = csp_account(osp_factory)
+    iam = test_iam.iam()
+    iam.portal_roles["Wallet Viewer (test)"] = {"view_dataspace_wallet"}
+    try:
+        token = person(osp, "p6-viewer", CSPC, roles=("Wallet Viewer (test)",))
+        assert osp.get(_VIEW.format(tu(1)), token).status_code == 200            # may view
+        r = retrieve(osp, token, 1)
+        assert r.status_code == 403 and ptype(r) == "urn:c4-m2:problem:forbidden"
+        assert creds(1) is not None and acct(1)["credentials_state"] == "AVAILABLE"
+    finally:
+        iam.portal_roles.pop("Wallet Viewer (test)", None)
+
+
+def test_case_15_retrieval_writes_the_audit_entry_and_consumes_the_row_in_one_operation(osp_factory, companies):
+    # README 7.3 step 4 (one transaction: row deleted, credentials_state RETRIEVED, audit entry with the sub), 5 audit_log
+    osp = csp_account(osp_factory)
+    ref = acct(1)["id"]
+    token = person(osp, "p1-erika", CSPC)
+    assert [e for e in store().list_audit() if e["object_id"] == ref and e["sub"] == "p1-erika"] == []
+    r = retrieve(osp, token, 1)
+    assert r.status_code == 200, r.text
+    assert store().get_account_credentials(ref) is None and acct(1)["credentials_state"] == "RETRIEVED"
+    entries = [e for e in store().list_audit() if e["object_id"] == ref and e["sub"] == "p1-erika"]
+    assert len(entries) == 1, entries
+    e = entries[0]
+    assert e["operation"] and isinstance(e["operation"], str)
+    assert e["azp"] == "portal-ui" and e["company_id"] == CSPC["id"]            # claims of the person token
+    assert r.json()["clientSecret"] not in repr(e)
+
+
+# -------------------------------------------------------- README 7.6 callbacks: order of checks, branches
+def test_callback_checks_permission_and_client_before_looking_up_the_account(osp_factory, companies):
+    # README 7.6: "otherwise 403" for permission and azp; the unknown externalId (404) comes after
+    osp = div_requested(osp_factory)
+    ghost = str(uuid.uuid4())
+    wrong_client = osp.service("sa-other-callback", ["submit_wallet_callback"])
+    wrong_perm = osp.service("sa-div-callback", ["query_c4_m2"])
+    for token in (wrong_client, wrong_perm):
+        assert cb_create(osp, ghost, token=token).status_code == 403
+        assert cb_delete(osp, ghost, token=token).status_code == 403
+    assert cb_create(osp, ghost).status_code == 404 and cb_delete(osp, ghost).status_code == 404   # right client
+    assert acct(1)["status"] == "REQUESTED"
+
+
+def test_delete_callback_for_an_account_that_was_never_deleted_is_409(osp_factory, companies):
+    # README 7.6 delete step 1: status other than DELETING (here REQUESTED, no deletion ordered) -> 409 invalid-state
+    osp = div_requested(osp_factory)
+    r = cb_delete(osp, acct(1)["id"])
+    assert r.status_code == 409 and ptype(r) == "urn:c4-m2:problem:invalid-state"
+    assert acct(1)["status"] == "REQUESTED" and not acct(1)["deletion_ordered_at"]
+    assert evs(osp, "WalletAccountDeleted") == []
+
+
+def test_create_callback_on_a_retrieved_active_account_is_204_without_change(osp_factory, companies):
+    # README 7.6 create step 2 `ACTIVE`: 204 without change, also after the credentials were retrieved (6.9)
+    osp = div_active(osp_factory)
+    ref = acct(1)["id"]
+    assert retrieve(osp, person(osp, "p1-div", DIV), 1).status_code == 200
+    assert acct(1)["credentials_state"] == "RETRIEVED" and creds(1) is None
+    r = cb_create(osp, ref, secret="a-late-duplicate-secret")
+    assert r.status_code == 204, r.text
+    assert acct(1)["status"] == "ACTIVE" and acct(1)["credentials_state"] == "RETRIEVED"
+    assert store().get_account_credentials(ref) is None                     # no new credentials appear
+    assert len(evs(osp, "WalletAccountCreated")) == 1
+
+
+# --------------------------------------------------------------- provider errors (README 8.2, 8.3, 6.9)
+def test_sap_div_order_error_on_create_is_502_and_account_stays_requested(osp_factory, companies, monkeypatch):
+    # README 8.2 step 4 SAP DIV + technical error: 502 upstream-error, the account stays REQUESTED without
+    # provider_ordered_at; 6.9 a repetition sends the order again; 14.3 `<BPN>:ORDER_ERROR`
+    osp = osp_factory(env=ENV)
+    make_wallet(DIV, "SAP_DIV")
+    monkeypatch.setenv("STUB_FAILURES", f"{DIV['bpn']}:ORDER_ERROR")
+    assert_problem(step_problem(m2().create_wallet_account, DIV, 1), 502, "upstream-error", retryable=True)
+    a = acct(1)
+    assert a["status"] == "REQUESTED" and not a["provider_ordered_at"] and creds(1) is None
+    assert osp.events("WalletAccountCreated") == [] and osp.events("WalletAccountFailed") == []
+    monkeypatch.setenv("STUB_FAILURES", "")
+    out = create(DIV, 1)
+    assert out["state"] == "RUNNING" and acct(1)["id"] == a["id"] and acct(1)["provider_ordered_at"]
+    assert any(o["external_id"] == a["id"] for o in account_orders("account"))
+    providers().flush_stand_in()
+    assert acct(1)["status"] == "ACTIVE"
+
+
+def test_sap_div_order_error_on_delete_is_502_and_account_stays_deleting(osp_factory, companies, monkeypatch):
+    # README 8.3 step 4 SAP DIV "Error: 502, the account stays DELETING without deletion_ordered_at"; step 5 "Without:
+    # send the order again"
+    osp = div_active(osp_factory)
+    ref = acct(1)["id"]
+    monkeypatch.setenv("STUB_FAILURES", f"{DIV['bpn']}:ORDER_ERROR")
+    assert_problem(step_problem(m2().delete_wallet_account, DIV, 1), 502, "upstream-error", retryable=True)
+    a = acct(1)
+    assert a["status"] == "DELETING" and not a["deletion_ordered_at"]
+    assert creds(1) is not None and evs(osp, "WalletAccountDeleted") == []
+    before = len(account_orders("account-deletion"))
+    monkeypatch.setenv("STUB_FAILURES", "")
+    out = delete(DIV, 1)                                                    # repetition: the order goes out again
+    assert out["state"] == "RUNNING" and out["result"]["status"] == "DELETING"
+    assert acct(1)["deletion_ordered_at"]
+    orders = account_orders("account-deletion")
+    assert len(orders) > before and orders[-1]["external_id"] == ref
+    providers().flush_stand_in()
+    assert acct(1)["status"] == "DELETED" and len(evs(osp, "WalletAccountDeleted", 1)) == 1
+
+
+def csp_with_http_handler(osp_factory, monkeypatch, handler):
+    """Shared CSP stand-in over HTTP (as test_c4_m2_providers.py); `handler(method, url)` may answer a call itself."""
+    real = phttp.request
+
+    def request(method, url, timeout=phttp.DEFAULT_TIMEOUT, **kw):
+        answer = handler(method.upper(), url)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer if answer is not None else real(method, url, timeout=timeout, **kw)
+
+    monkeypatch.setattr(phttp, "request", request)
+    osp = osp_factory(env={**ENV, "CSP_WALLET_URL": CSP_URL + "/wallet/v1", "DID_RESOLVER_URL": CSP_URL}, csp=True)
+    osp.csp_register(CSPC["bpn"])
+    make_wallet(CSPC, "CSP")
+    create(CSPC, 1)
+    assert acct(1)["status"] == "ACTIVE"
+    return osp
+
+
+def _is_account_delete(method: str, url: str) -> bool:
+    return method == "DELETE" and "/wallet/v1/wallets/" in url and "/accounts/" in url
+
+
+def test_delete_at_csp_404_counts_as_deleted(osp_factory, companies, monkeypatch):
+    # README 8.3 step 4 CSP "204 or 404: status DELETED, event WalletAccountDeleted"
+    osp = csp_with_http_handler(osp_factory, monkeypatch,
+                                lambda m, u: httpx.Response(404) if _is_account_delete(m, u) else None)
+    ref = acct(1)["id"]
+    out = delete(CSPC, 1, walletAccountRef=ref)
+    assert out["result"]["status"] == "DELETED" and acct(1)["status"] == "DELETED"
+    assert store().get_account_credentials(ref) is None and len(evs(osp, "WalletAccountDeleted", 1)) == 1
+
+
+@pytest.mark.parametrize("failure", ["http-500", "timeout"])
+def test_delete_at_csp_error_is_502_and_account_stays_active(osp_factory, companies, monkeypatch, failure):
+    # README 8.3 step 4 CSP "Error: 502, the account stays ACTIVE"; 12 `upstream-error` retryable
+    def handler(m, u):
+        if _is_account_delete(m, u):
+            return httpx.ReadTimeout("timed out") if failure == "timeout" else httpx.Response(500, json={"error": "x"})
+        return None
+
+    osp = csp_with_http_handler(osp_factory, monkeypatch, handler)
+    ref = acct(1)["id"]
+    assert_problem(step_problem(m2().delete_wallet_account, CSPC, 1, walletAccountRef=ref), 502, "upstream-error",
+                   retryable=True)
+    assert acct(1)["status"] == "ACTIVE" and creds(1) is not None
+    assert evs(osp, "WalletAccountDeleted") == []
+
+
+# ------------------------------------------------------------------- validation, precondition order, races
+BAD_INPUTS = [(f, v) for f in ("technicalUserId", "companyId") for v in (None, "not-a-uuid")]
+
+
+@pytest.mark.parametrize("step", ["create_wallet_account", "delete_wallet_account"])
+@pytest.mark.parametrize("field,bad", BAD_INPUTS, ids=[f"{f}-{'missing' if v is None else v}" for f, v in BAD_INPUTS])
+def test_step_input_validation_is_400_validation(osp_factory, companies, step, field, bad):
+    # README 12 `validation` 400 (retryable false); 8.2 / 8.3 input `technicalUserId`, `companyId` (uuid, openapi)
+    osp = osp_factory(env=ENV)
+    make_wallet(DIV, "SAP_DIV")
+    body = step_input(DIV["id"], next(_steps), technicalUserId=tu(1))
+    if bad is None:
+        body.pop(field)
+    else:
+        body[field] = bad
+    with pytest.raises(Exception) as e:
+        getattr(m2(), step)(body)
+    assert_problem(problems.to_problem(MODULE, e.value, True), 400, "validation")
+    r = osp.post("/api/c4-m2/steps/" + step.replace("_", "-"), osp.service("svc-c4-m2"), json=body)
+    assert r.status_code == 400 and ptype(r) == "urn:c4-m2:problem:validation", r.text    # never 422
+    assert store().list_accounts() == [] and account_orders() == []
+
+
+def test_create_with_wallet_not_active_and_company_inactive_reports_wallet_not_active(osp_factory, companies):
+    # README 8.2 Preconditions: the wallet is listed first ("... ACTIVE, otherwise 409 wallet-not-active. The company
+    # is ACTIVE ..., otherwise 409 company-not-active"), so wallet-not-active wins when both fail
+    osp = osp_factory(env=ENV)
+    m2().create_wallet(step_input(INA["id"], 1, provider="SAP_DIV"))        # REQUESTED (callback held), company INACTIVE
+    assert store().get_wallet(INA["id"])["status"] == "REQUESTED"
+    assert_problem(step_problem(m2().create_wallet_account, INA, 1), 409, "wallet-not-active")   # README 8.2
+    assert acct(1) is None and account_orders() == []
+
+
+def test_delete_with_foreign_ref_on_a_requested_account_reports_invalid_state_first(osp_factory, companies):
+    # README 8.3: preconditions (no account REQUESTED) are checked before the walletAccountRef conflict.
+    # OPEN-QUESTION (module docstring): the Input paragraph, which names the conflict, comes first in the README text.
+    osp = div_requested(osp_factory)
+    p = step_problem(m2().delete_wallet_account, DIV, 1, walletAccountRef=str(uuid.uuid4()))
+    assert_problem(p, 409, "invalid-state")
+    assert acct(1)["status"] == "REQUESTED" and account_orders("account-deletion") == []
+
+
+def test_concurrent_create_calls_for_one_technical_user_make_one_account(osp_factory, companies):
+    # README 6.9: advisory lock per technical user; "at most one row with a status other than DELETED" (README 5)
+    osp = osp_factory(env=ENV)
+    make_wallet(IH, "IDENTITY_HUB")
+    barrier = threading.Barrier(2)
+
+    def call(n: int):
+        barrier.wait(timeout=10)
+        return m2().create_wallet_account(step_input(IH["id"], 500 + n, technicalUserId=tu(1)))
+
+    with ThreadPoolExecutor(2) as pool:
+        outs = [f.result(timeout=30) for f in [pool.submit(call, 1), pool.submit(call, 2)]]
+    rows = [a for a in store().list_accounts(statuses=None) if a["technical_user_id"] == tu(1)]
+    assert len(rows) == 1 and rows[0]["status"] == "ACTIVE"
+    assert sorted(o["state"] for o in outs) == ["DONE", "RUNNING"]          # the second call saw the finished object (6.9)
+    assert len(evs(osp, "WalletAccountCreated", 1)) == 1
+    assert {o["result"]["walletAccountRef"] for o in outs} == {rows[0]["id"]}

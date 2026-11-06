@@ -63,6 +63,8 @@ def test_round_trip_returns_text_and_uses_the_configured_key_version(crypto):
 
 def test_ciphertext_is_aes_gcm_shaped_nonce_96_bit_and_tag_16_bytes(crypto):
     # README 4 "AES-256-GCM": 96-bit nonce (the AESGCM default) and a 16-byte tag appended to the ciphertext
+    # OPEN-QUESTION: nonce length 12 bytes and "tag appended" (len == plaintext + 16) are our convention
+    # (the `cryptography` AESGCM layout); README 5 only says `secret_encrypted, nonce bytea`.
     ciphertext, nonce, _ = crypto.encrypt(SECRET)
     assert len(nonce) == 12
     assert len(ciphertext) == len(SECRET.encode()) + 16
@@ -143,7 +145,8 @@ def test_unknown_key_version_is_rejected(crypto):
 # ------------------------------------------------------------------------------- SECRETS_KEY unset
 # OPEN-QUESTION: the shipped config/osp-*/module-config.json set no SECRETS_KEY and config/ is off-limits.
 # Reading adopted from TEAM3-PLAN section 1: unset SECRETS_KEY -> one random key per process, generated at
-# first use (safe because the store is in memory). `crypto.reset()` forgets it.
+# first use (safe because the store is in memory). `crypto.reset()` forgets it. The README does not describe
+# the unset case at all (it only lists SECRETS_KEY as the key); this is a convention, not spec.
 def test_unset_secrets_key_uses_a_random_per_process_key(crypto, monkeypatch):
     monkeypatch.delenv("SECRETS_KEY")
     crypto.reset()
@@ -180,6 +183,9 @@ def test_unset_secrets_key_is_not_the_hex_key_of_other_tests(crypto, monkeypatch
                          ids=["short", "not-hex", "31-bytes", "33-bytes", "blank", "0x-prefix"])
 def test_malformed_secrets_key_raises_a_clear_error_and_never_falls_back(crypto, monkeypatch, bad):
     # README 4: key = AES-256 as hex (64 hex chars); plan section 1: "A set but malformed key raises a clear error"
+    # OPEN-QUESTION: the README does not say what a malformed key does; we require an error whose message names
+    # SECRETS_KEY and no fallback to the random key. A whitespace-only value ("blank") counts as malformed here,
+    # not as unset (an unset variable gives the per-process random key).
     monkeypatch.setenv("SECRETS_KEY", bad)
     crypto.reset()
     with pytest.raises((ValueError, RuntimeError), match="SECRETS_KEY"):

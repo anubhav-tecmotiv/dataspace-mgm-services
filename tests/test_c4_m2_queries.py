@@ -190,7 +190,7 @@ def test_own_wallet_view_uses_the_wallet_schema_not_wallet_info(osp_factory, com
     assert body["bdrsUrl"] == BDRS                                      # README 7.1: BDRS_PUBLIC_URL
     assert body["supportsWalletAccounts"] is True
     assert re.match(r"^\d{4}-\d{2}-\d{2}T", body["createdAt"]) and body["activatedAt"]
-    assert body["stsTokenUrl"] == (STS if provider == "IDENTITY_HUB" else None)   # README 7.1: IdentityHub only
+    assert body.get("stsTokenUrl") == (STS if provider == "IDENTITY_HUB" else None)   # README 7.1: IdentityHub only (property optional)
     assert body["didDocumentLocation"].startswith("https://") and body["credentialServiceUrl"]
     assert body == seam("modules.c4_m2.interface").wallet_view(companyId=cid)
 
@@ -401,7 +401,8 @@ def test_every_holder_access_retrieval_over_http_writes_an_audit_entry_without_s
 
 def test_in_process_holder_access_writes_an_audit_entry_too(osp_factory, companies):
     # README 5 audit_log: "In the same process without a token, the entry holds the name of the calling module"
-    # OPEN-QUESTION: the field that carries the module name (sub or azp) is not fixed; only the entry is asserted.
+    # OPEN-QUESTION: the field that carries the module name (sub or azp) and its spelling are not fixed; the
+    # entry must contain the calling module's name, C4-M1 (README 9.3: only C4-M1 asks), in some field.
     osp = osp_factory(env=ENV)
     activate(osp, "csp", "CSP")
     interface = seam("modules.c4_m2.interface")
@@ -410,6 +411,8 @@ def test_in_process_holder_access_writes_an_audit_entry_too(osp_factory, compani
     access = interface.get_holder_access(companyId=COMPANIES["csp"]["id"])
     entries = store.list_audit()[before:]
     assert len(entries) == 1 and entries[0]["company_id"] == COMPANIES["csp"]["id"]
+    values = " ".join(str(v).lower() for v in entries[0].values())
+    assert "c4-m1" in values or "c4_m1" in values, entries[0]           # README 5: the calling module's name
     assert_no_secret(access["apiKey"], entries)
 
 
@@ -419,3 +422,37 @@ def test_failed_holder_access_retrieval_does_not_leak_into_the_audit_secret_scan
     create(osp, "div", "SAP_DIV")
     assert holder_http(osp, "div").status_code == 409
     assert_no_secret("clientSecret", seam("modules.c4_m2.interface").store().list_audit())
+
+
+# ================================================================= README 7.1: view of REQUESTED and FAILED
+def test_wallet_view_of_a_requested_wallet(osp_factory, companies):
+    # README 7.1 step 3 / openapi `Wallet`: no DID yet; did and didDocumentLocation are null, createdAt is set
+    osp = osp_factory(env=ENV)
+    create(osp, "div", "SAP_DIV")
+    cid = COMPANIES["div"]["id"]
+    view = seam("modules.c4_m2.interface").wallet_view(companyId=cid)
+    assert schema_errors("c4-m2", "Wallet", view) == []
+    assert view["status"] == "REQUESTED" and view["provider"] == "SAP_DIV" and view["companyId"] == cid
+    assert view.get("did") is None and view.get("didDocumentLocation") is None
+    assert view["createdAt"] and re.match(r"^\d{4}-\d{2}-\d{2}T", view["createdAt"])
+    assert view.get("failureReason") is None and view.get("activatedAt") is None
+    r = osp.get(f"/api/c4-m2/companies/{cid}/wallet", osp.person("p-req", ["IT Admin"], company_id=cid))
+    assert r.status_code == 200 and r.json() == view
+
+
+def test_wallet_view_of_a_failed_wallet(osp_factory, companies):
+    # README 7.1 step 3: `failureReason` (one of README 10 reasons); 14.3 DID_MISMATCH
+    bpn = COMPANIES["fail_did"]["bpn"]
+    osp = osp_factory(env={**ENV, "STUB_FAILURES": f"{bpn}:DID_MISMATCH"})
+    create(osp, "fail_did", "SAP_DIV")
+    seam("modules.c4_m2.providers").flush_stand_in()
+    seam("modules.c4_m2.service").run_timer_once()
+    cid = COMPANIES["fail_did"]["id"]
+    view = seam("modules.c4_m2.interface").wallet_view(companyId=cid)
+    assert schema_errors("c4-m2", "Wallet", view) == []
+    assert view["status"] == "FAILED"
+    assert view["failureReason"] in ("PROVIDER_TIMEOUT", "DID_MISMATCH", "INVALID_DID_DOCUMENT", "DID_NOT_RESOLVABLE")
+    assert view["failureReason"] == "DID_MISMATCH" and view["createdAt"]
+    assert view.get("activatedAt") is None
+    r = osp.get(f"/api/c4-m2/companies/{cid}/wallet", osp.person("p-fail", ["IT Admin"], company_id=cid))
+    assert r.status_code == 200 and r.json() == view

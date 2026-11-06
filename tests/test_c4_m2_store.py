@@ -358,6 +358,8 @@ def test_transaction_is_released_after_an_exception(store):
 
 # ------------------------------------------------------------------------------------ dump, reset
 def test_dump_is_json_serialisable_with_bytes_as_hex(store):
+    # OPEN-QUESTION: `store.dump()` and its shape (a dict of table name -> rows, bytes as hex) are a TEAM3-PLAN 12.2
+    # convention for secret scans; the README (5) only fixes the tables and that secrets are not stored in plain text.
     # TEAM3-PLAN 12.2 dump(): "JSON-serialisable full state, bytes as hex; for secret scans"
     w = wallet(1, did=DID_A, status="VALIDATING")
     store.put_wallet(w)

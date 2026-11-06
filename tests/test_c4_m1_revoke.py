@@ -29,6 +29,7 @@
 """
 from __future__ import annotations
 
+import datetime as dt
 import uuid
 
 import pytest
@@ -119,9 +120,14 @@ def assert_problem(r, status: int, name: str, retryable: bool | None = None) -> 
     return body
 
 
+def ts(minutes: int = 0) -> dt.datetime:
+    """Store rows hold tz-aware datetimes (TEAM3-PLAN 12.3: `service.now() -> datetime`)."""
+    return dt.datetime(2026, 11, 6, 9, 0, tzinfo=dt.UTC) + dt.timedelta(minutes=minutes)
+
+
 def put_row(company_key: str, ctype: str, status: str, attempt: int = 1, **fields) -> dict:
     c = COMPANIES[company_key]
-    now = "2026-11-06T09:00:00Z"
+    now = ts(0)
     row = {"id": str(uuid.uuid4()), "company_id": c["id"], "credential_type": ctype, "status": status,
            "route": "STUB", "issuer_did": None, "wallet_provider": "STUB", "bpn": c["bpn"].upper(),
            "holder_did": f"did:web:wallet.example.org:{c['bpn']}", "request_ref": f"stub-{attempt}",
@@ -135,7 +141,7 @@ def put_row(company_key: str, ctype: str, status: str, attempt: int = 1, **field
 def issued_rows() -> None:
     """Both rows ISSUED, written through the store (no timers needed)."""
     for t in TYPES:
-        put_row("u1", t, "ISSUED", 1, issued_at="2026-11-06T09:01:00Z")
+        put_row("u1", t, "ISSUED", 1, issued_at=ts(1))
 
 
 def revoked_events(osp) -> list[dict]:
@@ -317,7 +323,7 @@ def test_case_10_late_success_report_over_http_revokes_at_once(osp_factory, comp
 def test_readme_8_2_failed_row_becomes_cancelled_without_event(osp_factory, companies, wallet_fake):
     # README 8.2: REQUESTED, FAILED -> CANCELLED, no event
     osp = osp_factory()
-    put_row("u1", "MEMBERSHIP", "FAILED", 2, failure_reason="declined", failed_at="2026-11-06T09:05:00Z")
+    put_row("u1", "MEMBERSHIP", "FAILED", 2, failure_reason="declined", failed_at=ts(5))
     result = done(revoke(osp))
     assert result["cancelled"] == ["MEMBERSHIP"] and result["revoked"] == []
     row = row_of(U1, "MEMBERSHIP")
@@ -343,7 +349,7 @@ def test_readme_8_2_failed_round_is_not_a_running_round(osp_factory, companies, 
 def test_readme_8_2_mixed_types_are_revoked_and_cancelled_in_one_run(osp_factory, companies, wallet_fake):
     # README 8.2 per type: ISSUED -> revoked (event), REQUESTED -> cancelled (no event)
     osp = osp_factory()
-    put_row("u1", "BPN", "ISSUED", 1, issued_at="2026-11-06T09:01:00Z")
+    put_row("u1", "BPN", "ISSUED", 1, issued_at=ts(1))
     put_row("u1", "MEMBERSHIP", "REQUESTED", 2)
     result = done(revoke(osp, credentialTypes=["BPN", "MEMBERSHIP"]))
     assert result["revoked"] == ["BPN"] and result["cancelled"] == ["MEMBERSHIP"]
@@ -364,6 +370,78 @@ def test_readme_8_2_cancelled_pending_and_revoked_rows_are_left_alone(osp_factor
     assert history(U1, "MEMBERSHIP") == []                           # put directly: no history was written
 
 
+# ------------------------------------------------------------- routes that cannot revoke (manual revocation)
+U4 = COMPANIES["u4"]["id"]
+
+
+def put_issuer_row(ctype: str, status: str, attempt: int = 1, **fields) -> dict:
+    """A row of the route CREDENTIAL_ISSUER (README 6.3 table: revocation not supported in 0.2), SAP DIV wallet."""
+    return put_row("u4", ctype, status, attempt, route="CREDENTIAL_ISSUER", wallet_provider="SAP_DIV",
+                   request_ref="", **fields)
+
+
+def test_case_11_revoke_on_credential_issuer_route_is_revocation_pending_and_manual(osp_factory, companies,
+                                                                                   wallet_fake):
+    # README 13 case 11, 8.2 ISSUED bullet "route cannot: REVOCATION_PENDING, no event", 6.1 row 6, 6.3 table;
+    # no test server is needed: the module must not call the Credential Issuer for a revocation at all
+    osp = osp_factory()
+    put_issuer_row("MEMBERSHIP", "ISSUED", issued_at=ts(1))
+    result = done(revoke(osp, U4))
+    assert result == {"companyId": U4, "revoked": [], "cancelled": [], "manualRevocation": ["MEMBERSHIP"]}
+    row = row_of(U4, "MEMBERSHIP")
+    assert row["status"] == "REVOCATION_PENDING" and row["route"] == "CREDENTIAL_ISSUER"
+    assert row["revocation_reason"] == "COMPANY_DEACTIVATED" and not row["revoked_at"]
+    assert history(U4, "MEMBERSHIP")[-1] == ("REVOCATION_PENDING", 1)          # README 6.1: every change has history
+    assert revoked_events(osp) == []                                            # no event until OSP staff confirm
+
+
+def test_case_11_second_revoke_leaves_revocation_pending_alone(osp_factory, companies, wallet_fake):
+    # README 8.2: REVOCATION_PENDING -> nothing (no change, no event, no new history entry); the step is DONE
+    # OPEN-QUESTION: whether `manualRevocation` of the repeated step still lists the pending type (README 8.2:
+    # "types in REVOCATION_PENDING") is not tested; only that the row and the event log stay as they are.
+    osp = osp_factory()
+    put_issuer_row("MEMBERSHIP", "ISSUED", issued_at=ts(1))
+    done(revoke(osp, U4, n=90))
+    before = (snapshot(U4, "MEMBERSHIP"), len(osp.events()), history(U4, "MEMBERSHIP"))
+    result = done(revoke(osp, U4, n=91))
+    assert result["revoked"] == [] and result["cancelled"] == []
+    assert (snapshot(U4, "MEMBERSHIP"), len(osp.events()), history(U4, "MEMBERSHIP")) == before
+    assert status_of(U4, "MEMBERSHIP") == "REVOCATION_PENDING" and revoked_events(osp) == []
+
+
+def test_case_11_issue_credentials_on_a_pending_revocation_is_invalid_state(osp_factory, companies, wallet_fake):
+    # README 8.1 step 2: REVOCATION_PENDING -> 409 invalid-state before anything is sent (OSP staff confirm first)
+    osp = osp_factory()
+    put_issuer_row("BPN", "ISSUED", issued_at=ts(1))
+    put_issuer_row("MEMBERSHIP", "ISSUED", issued_at=ts(1))
+    done(revoke(osp, U4))
+    r = osp.post(ISSUE, osp.service("svc-c4-m1"), json=step_input(U4, 91, credentialTypes=["MEMBERSHIP"]))
+    assert_problem(r, 409, "invalid-state", retryable=False)
+    assert status_of(U4, "MEMBERSHIP") == "REVOCATION_PENDING" and row_of(U4, "MEMBERSHIP")["attempt"] == 1
+    assert orders() == []
+
+
+def test_case_11_both_types_on_credential_issuer_route_are_pending_and_listed_as_manual(osp_factory, companies,
+                                                                                       wallet_fake):
+    # README 8.2 Result: manualRevocation = types in REVOCATION_PENDING (both given types here), no event
+    osp = osp_factory()
+    put_issuer_row("BPN", "ISSUED", issued_at=ts(1))
+    put_issuer_row("MEMBERSHIP", "ISSUED", issued_at=ts(1))
+    result = done(revoke(osp, U4, credentialTypes=["BPN", "MEMBERSHIP"]))
+    assert result["revoked"] == [] and sorted(result["manualRevocation"]) == TYPES
+    assert [status_of(U4, t) for t in TYPES] == ["REVOCATION_PENDING", "REVOCATION_PENDING"]
+    assert revoked_events(osp) == []
+
+
+def test_case_11_requested_row_on_credential_issuer_route_is_cancelled_not_pending(osp_factory, companies, wallet_fake):
+    # README 8.2: REQUESTED, FAILED -> CANCELLED, no event (only the route CSP_ISSUER removes a grant first)
+    osp = osp_factory()
+    put_issuer_row("MEMBERSHIP", "REQUESTED")
+    result = done(revoke(osp, U4))
+    assert result["cancelled"] == ["MEMBERSHIP"] and result["manualRevocation"] == []
+    assert status_of(U4, "MEMBERSHIP") == "CANCELLED" and revoked_events(osp) == []
+
+
 # ----------------------------------------------------------------------- no credentials, preconditions
 def test_readme_8_2_without_credentials_of_the_given_types_the_step_is_done_at_once(osp_factory, companies,
                                                                                    wallet_fake):
@@ -373,8 +451,7 @@ def test_readme_8_2_without_credentials_of_the_given_types_the_step_is_done_at_o
     assert result == {"companyId": U1, "revoked": [], "cancelled": [], "manualRevocation": []}
     assert store().list_credentials(company_id=U1) == []             # a revocation creates no rows
     assert store().get_run(U1) is None
-    assert osp.events() == [] or all(e["type"] not in ("CredentialRevoked", "CredentialsIssued")
-                                     for e in osp.events())
+    assert osp.events("CredentialRevoked") == [] and osp.events("CredentialsIssued") == []
 
 
 def test_readme_8_2_no_precondition_on_company_or_wallet(osp_factory, companies, wallet_fake):

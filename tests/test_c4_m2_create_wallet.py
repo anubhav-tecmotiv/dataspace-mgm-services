@@ -29,11 +29,13 @@ TEAM3-PLAN.md section 12 are imported lazily inside the tests.
 """
 from __future__ import annotations
 
+import threading
 import uuid
 
 import pytest
 import yaml
 
+from portal_common import http as phttp
 from portal_common import problems, spec
 from portal_common.problems import Problem
 from test_c4_m2_common import (COMPANIES, Clock, companies, event_errors, osp_factory, response_errors,  # noqa: F401
@@ -58,6 +60,27 @@ def m2():
 
 def providers():
     return seam("modules.c4_m2.providers")
+
+
+def service():
+    return seam("modules.c4_m2.service")
+
+
+class HttpSpy:
+    """Records every `portal_common.http.request` (method, url, kwargs) and passes it on."""
+
+    def __init__(self, monkeypatch) -> None:
+        self.calls: list[tuple[str, str, dict]] = []
+        real = phttp.request
+
+        def request(method, url, timeout=phttp.DEFAULT_TIMEOUT, **kw):
+            self.calls.append((method.upper(), url, kw))
+            return real(method, url, timeout=timeout, **kw)
+
+        monkeypatch.setattr(phttp, "request", request)
+
+    def urls(self) -> list[str]:
+        return [u for _, u, _ in self.calls]
 
 
 def create(company: dict, n: int = 1, **extra) -> dict:
@@ -111,6 +134,8 @@ def test_case_01_sap_div_running_then_active_after_callback(osp_factory, compani
     assert events_of(osp, "DataspaceWalletCreated") == []                    # not yet
 
     providers().flush_stand_in()                   # the stand-in calls the callback code itself (11.1)
+    assert row(DIV)["status"] in ("VALIDATING", "ACTIVE")      # README 7.6 step 6: the check runs in the background
+    service().run_timer_once()                     # project convention: finishes any pending DID check
     w = row(DIV)
     assert w["status"] == "ACTIVE" and w["did"] == DIV_DID and w["activated_at"] and w["did_validated_at"]
     created = events_of(osp, "DataspaceWalletCreated")
@@ -130,6 +155,7 @@ def test_case_01_event_did_is_the_did_of_get_wallet_info(osp_factory, companies)
     osp = osp_factory(env=HOLD_CALLBACK)
     create(DIV, 1, provider="SAP_DIV")
     providers().flush_stand_in()
+    service().run_timer_once()
     info = m2().get_wallet_info(companyId=DIV["id"])
     ev = events_of(osp, "DataspaceWalletCreated")[0]
     assert ev["data"]["did"] == info["did"] == DIV_DID
@@ -168,7 +194,9 @@ def test_case_02_repeat_after_active_is_done_without_order_or_event(osp_factory,
     osp = osp_factory(env=HOLD_CALLBACK)
     create(DIV, 1, provider="SAP_DIV")
     providers().flush_stand_in()
+    service().run_timer_once()
     before = row(DIV)
+    assert before["status"] == "ACTIVE"
     out = create(DIV, 2, provider="SAP_DIV")
     res = assert_step_result(out, DIV, 2, "DONE", "SAP_DIV")
     assert res["status"] == "ACTIVE" and res["did"] == DIV_DID
@@ -227,6 +255,7 @@ def test_case_04_wrong_did_fails_then_new_attempt_is_active(osp_factory, compani
     out = create(FAIL01, 1, provider="SAP_DIV")
     assert_step_result(out, FAIL01, 1, "RUNNING", "SAP_DIV")
     providers().flush_stand_in()
+    service().run_timer_once()                     # the wrong form is decided at once; the pass changes nothing
     w = row(FAIL01)
     assert w["status"] == "FAILED" and w["failure_reason"] == "DID_MISMATCH" and w["attempt"] == 1
     failed = events_of(osp, "DataspaceWalletFailed")
@@ -249,6 +278,7 @@ def test_case_04_wrong_did_fails_then_new_attempt_is_active(osp_factory, compani
     assert m2().store().get_secret(w["id"], "HOLDER_ACCESS") is None          # secrets deleted
     assert len(providers().orders()) == 2
     providers().flush_stand_in()
+    service().run_timer_once()
     w3 = row(FAIL01)
     assert w3["status"] == "ACTIVE" and w3["attempt"] == 2
     assert w3["did"] == "did:web:div.example.org:did:BPNL000000FAIL01"
@@ -334,6 +364,7 @@ def test_case_10_div_csp_and_ih_wallets_in_one_installation(osp_factory, compani
     create(CSPC, 2, provider="CSP")
     create(IH, 3, provider="IDENTITY_HUB")
     providers().flush_stand_in()
+    service().run_timer_once()
     expected = [(DIV, "SAP_DIV", "ISSUER_WRITES", DIV_DID), (CSPC, "CSP", "HOLDER_REQUESTS", CSP_DID),
                 (IH, "IDENTITY_HUB", "HOLDER_REQUESTS", IH_DID)]
     walletids = set()
@@ -384,22 +415,46 @@ def test_provider_selection_default_provider_unset_means_csp(osp_factory, compan
     ("SAP_DIV", "", "CSP"),
     ("SAP_DIV,IDENTITY_HUB", "", "CSP"),
     ("CSP", "", "SAP_DIV"),
-    ("SAP_DIV,CSP", "", "BRING_YOUR_OWN"),                 # README 6.1: not active in version 0.2
-    ("SAP_DIV,IDENTITY_HUB,CSP", "", "BRING_YOUR_OWN"),
     ("SAP_DIV,IDENTITY_HUB", "CSP", None),                 # DEFAULT_PROVIDER itself not enabled
     ("SAP_DIV", "", None),                                 # empty default = CSP, not enabled
 ])
 def test_provider_not_in_enabled_providers_is_400(osp_factory, companies, enabled, default, given):
-    # README 6.1, 12: 400 provider-not-enabled, retryable false
+    # README 6.1, 12: 400 provider-not-enabled, retryable false (a real provider missing from ENABLED_PROVIDERS)
     osp_factory(env={"ENABLED_PROVIDERS": enabled, "DEFAULT_PROVIDER": default})
     extra = {"provider": given} if given else {}
     assert_problem(step_problem(DIV["id"], 1, **extra), 400, "provider-not-enabled")
     assert row(DIV) is None
 
 
+@pytest.mark.parametrize("enabled", ["SAP_DIV,CSP", "SAP_DIV,IDENTITY_HUB,CSP", "SAP_DIV,IDENTITY_HUB,CSP,BRING_YOUR_OWN"])
+def test_provider_bring_your_own_as_input_is_400(osp_factory, companies, enabled):
+    # README 6.1: BRING_YOUR_OWN is not active in version 0.2 (items 1 and 2 do not apply), 400.
+    # OPEN-QUESTION: README 6.1 gives `provider-not-enabled`, but openapi `StepCreateWallet.provider` has the enum
+    # [SAP_DIV, IDENTITY_HUB, CSP] only, so a schema check would answer 400 `validation`. Both are accepted.
+    osp_factory(env={"ENABLED_PROVIDERS": enabled})
+    p = step_problem(DIV["id"], 1, provider="BRING_YOUR_OWN")
+    assert p.status == 400 and p.name in ("validation", "provider-not-enabled"), (p.status, p.name)
+    assert p.ext.get("retryable") is False
+    assert row(DIV) is None
+
+
+def test_empty_enabled_providers_means_all_three_and_empty_default_means_csp(osp_factory, companies):
+    # README 4: `ENABLED_PROVIDERS` empty = SAP_DIV,IDENTITY_HUB,CSP; `DEFAULT_PROVIDER` empty = CSP (14.2 providers seam)
+    osp = osp_factory(env={**HOLD_CALLBACK, "ENABLED_PROVIDERS": "", "DEFAULT_PROVIDER": ""})
+    assert sorted(providers().enabled()) == ["CSP", "IDENTITY_HUB", "SAP_DIV"]
+    assert providers().default_provider() == "CSP"
+    assert create(DIV, 1, provider="SAP_DIV")["result"]["provider"] == "SAP_DIV"
+    assert create(IH, 2, provider="IDENTITY_HUB")["result"]["provider"] == "IDENTITY_HUB"
+    assert create(CSPC, 3, provider="CSP")["result"]["provider"] == "CSP"
+    assert create(FAIL01, 4)["result"]["provider"] == "CSP"                  # no input, empty default = CSP
+    assert osp.events("DataspaceWalletFailed") == []
+
+
 # ------------------------------------------------------------------------------------ preconditions
 @pytest.mark.parametrize("bad", [
     {"processId": uuid_str(900), "stepRunId": uuid_str(1)},                                   # no companyId
+    {"stepRunId": uuid_str(1), "companyId": DIV["id"]},                                        # no processId (required)
+    {"processId": uuid_str(900), "companyId": DIV["id"]},                                      # no stepRunId (required)
     {"processId": uuid_str(900), "stepRunId": uuid_str(1), "companyId": "not-a-uuid"},
     {"processId": uuid_str(900), "stepRunId": uuid_str(1), "companyId": None},
     {"processId": uuid_str(900), "stepRunId": uuid_str(1), "companyId": DIV["id"], "provider": "OTHER"},
@@ -482,18 +537,21 @@ def test_create_wallet_over_http_with_service_token(osp_factory, companies):
 @pytest.mark.parametrize("company_id,extra,status,name", [
     ("99999999-0000-4000-8000-000000000999", {}, 404, "not-found"),
     (COMPANIES["no_bpn"]["id"], {}, 409, "company-not-ready"),
-    (DIV["id"], {"provider": "BRING_YOUR_OWN"}, 400, "provider-not-enabled"),
+    # OPEN-QUESTION: README 6.1 says provider-not-enabled, openapi enum of `provider` would give validation
+    (DIV["id"], {"provider": "BRING_YOUR_OWN"}, 400, ("validation", "provider-not-enabled")),
+    (DIV["id"], {"provider": "SAP_DIV"}, 400, "provider-not-enabled"),                         # with ENABLED_PROVIDERS=CSP
     ("not-a-uuid", {}, 400, "validation"),
 ])
 def test_create_wallet_errors_over_http_are_problem_details(osp_factory, companies, company_id, extra, status, name):
     # README 12: type urn:c4-m2:problem:<name>, retryable false on steps (FRAMEWORK 4.5)
-    osp = osp_factory()
+    osp = osp_factory(env={"ENABLED_PROVIDERS": "CSP"} if extra.get("provider") == "SAP_DIV" else None)
     r = osp.post("/api/c4-m2/steps/create-wallet", osp.service("svc-c4-m2"),
                  json=step_input(company_id, 1, **extra))
     assert r.status_code == status, r.text
     assert r.headers["content-type"].startswith("application/problem+json")
     body = r.json()
-    assert body["type"] == f"urn:c4-m2:problem:{name}" and body["status"] == status
+    names = name if isinstance(name, tuple) else (name,)
+    assert body["type"] in [f"urn:c4-m2:problem:{n}" for n in names] and body["status"] == status
     assert body["retryable"] is False
 
 
@@ -506,3 +564,104 @@ def test_create_wallet_over_http_needs_a_token_and_the_step_permission(osp_facto
     r = osp.post("/api/c4-m2/steps/create-wallet", no_perm, json=body)
     assert r.status_code == 403 and r.json()["type"] == "urn:c4-m2:problem:forbidden"
     assert m2().store().get_wallet(IH["id"]) is None
+
+
+# ------------------------------------------------------------------ README 8.1 step 2: ACTIVE is final
+def test_repeat_after_active_with_a_different_provider_is_done_with_the_existing_provider(osp_factory, companies):
+    # README 8.1 step 2: ACTIVE -> DONE with the result, no event; the new `provider` input is not looked at
+    osp = osp_factory()
+    create(IH, 1, provider="IDENTITY_HUB")
+    assert row(IH)["status"] == "ACTIVE"
+    out = create(IH, 2, provider="CSP")
+    res = assert_step_result(out, IH, 2, "DONE", "IDENTITY_HUB")
+    assert res["status"] == "ACTIVE" and res["did"] == IH_DID
+    assert row(IH)["provider"] == "IDENTITY_HUB" and row(IH)["attempt"] == 1
+    assert len(providers().orders()) == 1
+    assert len(events_of(osp, "DataspaceWalletCreated")) == 1
+
+
+# ------------------------------------------------------------------------------ README 6.9 concurrency
+def test_two_concurrent_create_wallet_calls_make_one_order_and_one_event(osp_factory, companies):
+    # README 6.9: steps for the same company never run at the same time (advisory lock on company_id)
+    osp = osp_factory()
+    barrier = threading.Barrier(2)
+    outs: list = []
+    errors: list = []
+
+    def work(n: int) -> None:
+        try:
+            barrier.wait(timeout=5)
+            outs.append(create(IH, n, provider="IDENTITY_HUB"))
+        except BaseException as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=work, args=(n,)) for n in (1, 2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=20)
+    assert not errors and len(outs) == 2
+    # one call found no wallet (RUNNING even though complete in the call, 6.9); the other saw it complete or running
+    assert sorted(o["state"] for o in outs) in (["DONE", "RUNNING"], ["RUNNING", "RUNNING"])
+    assert any(o["state"] == "RUNNING" for o in outs)
+    assert len(providers().orders()) == 1
+    assert len(events_of(osp, "DataspaceWalletCreated")) == 1
+    assert row(IH)["status"] == "ACTIVE" and row(IH)["attempt"] == 1
+
+
+# --------------------------------------------------------------------------- README 6.10 scheduled tasks
+def test_requested_wallet_without_provider_ordered_at_is_not_timed_out(osp_factory, companies, monkeypatch):
+    # README 6.10: the callback deadline selects REQUESTED with `provider_ordered_at` older than the deadline;
+    # after provider-rejected (409) or a 502 the order was never accepted, so there is nothing to time out
+    bpn = COMPANIES["csp_rejected"]["bpn"]
+    osp = osp_factory(env={"STUB_FAILURES": f"{bpn}:CSP_REJECTED", "PROVIDER_CALLBACK_TIMEOUT_MINUTES": "1"})
+    clock = Clock().install(monkeypatch, "modules.c4_m2.service")
+    rejected = COMPANIES["csp_rejected"]
+    assert_problem(step_problem(rejected["id"], 1, provider="CSP"), 409, "provider-rejected")
+    unreachable = COMPANIES["byo"]                       # any company with a BPN: its order fails technically (502)
+    monkeypatch.setenv("STUB_FAILURES", f"{bpn}:CSP_REJECTED,{unreachable['bpn']}:ORDER_ERROR")
+    assert_problem(step_problem(unreachable["id"], 2, provider="IDENTITY_HUB"), 502, "upstream-error", True)
+    for c in (rejected, unreachable):
+        w = row(c)
+        assert w["status"] == "REQUESTED" and w["provider_ordered_at"] is None
+    clock.advance(days=3)                                # far past PROVIDER_CALLBACK_TIMEOUT_MINUTES
+    service().run_timer_once()
+    for c in (rejected, unreachable):
+        w = row(c)
+        assert w["status"] == "REQUESTED" and w["failure_reason"] is None and w["attempt"] == 1
+    assert osp.events("DataspaceWalletFailed") == [] and osp.events("DataspaceWalletCreated") == []
+
+
+def test_failed_wallet_is_never_retried_by_the_timer(osp_factory, companies, monkeypatch):
+    # README 6.2: FAILED leaves only through a new create-wallet; 6.10: the tasks select REQUESTED / VALIDATING
+    osp = osp_factory(env={**HOLD_CALLBACK, "STUB_FAILURES": f"{FAIL01['bpn']}:DID_MISMATCH"})
+    clock = Clock().install(monkeypatch, "modules.c4_m2.service")
+    create(FAIL01, 1, provider="SAP_DIV")
+    providers().flush_stand_in()
+    service().run_timer_once()
+    assert row(FAIL01)["status"] == "FAILED"
+    orders, events = len(providers().orders()), len(osp.events())
+    for _ in range(3):
+        clock.advance(days=2)
+        service().run_timer_once()
+    w = row(FAIL01)
+    assert w["status"] == "FAILED" and w["attempt"] == 1 and w["failure_reason"] == "DID_MISMATCH"
+    assert len(providers().orders()) == orders and len(osp.events()) == events
+
+
+# --------------------------------------------------------------- case 1 / 6.5: no directory BPN -> DID
+@pytest.mark.parametrize("company,provider", [(DIV, "SAP_DIV"), (IH, "IDENTITY_HUB"), (CSPC, "CSP")])
+def test_case_01_create_wallet_calls_no_directory_bpn_to_did(osp_factory, companies, monkeypatch, company, provider):
+    # README 13 case 1 "The module does not call any directory BPN -> DID", 6.5 (C3-M2 register-did does that).
+    # OPEN-QUESTION: no directory address is configurable here; we assert that no request goes to a directory /
+    # core-services path (`/v1/directory`, `/v1/discovery`, `bdrs`, `/holders`) or to BDRS_PUBLIC_URL.
+    spy = HttpSpy(monkeypatch)
+    osp = osp_factory(env={"BDRS_PUBLIC_URL": "https://bdrs.example.org/api/directory"})
+    create(company, 1, provider=provider)
+    providers().flush_stand_in()
+    service().run_timer_once()
+    assert row(company)["status"] == "ACTIVE"
+    for url in spy.urls():
+        low = url.lower()
+        assert not any(f in low for f in ("/v1/directory", "/v1/discovery", "bdrs", "/holders", "/v1/companies")), url
+    assert len(osp.events("DataspaceWalletCreated")) == 1
