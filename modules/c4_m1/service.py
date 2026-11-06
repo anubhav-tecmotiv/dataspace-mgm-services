@@ -340,3 +340,36 @@ def _revoke_now(row: dict) -> None:
             "revocationReason": row.get("revocation_reason") or "OTHER"})
     else:
         _change(row, "REVOCATION_PENDING")
+
+
+# ------------------------------------------------------------------------------------------------ reads
+def _iso(value: dt.datetime | None) -> str | None:
+    return value.isoformat() if value else None
+
+
+def _status_view(row: dict) -> dict:
+    return {"credentialType": row["credential_type"], "status": row["status"], "requestedAt": _iso(row.get("requested_at")),
+            "issuedAt": _iso(row.get("issued_at")), "revokedAt": _iso(row.get("revoked_at"))}
+
+
+def _rows_of(cid: str) -> list[dict]:
+    rows = store().list_credentials(company_id=cid, size=1000)
+    return sorted(rows, key=lambda r: TYPES.index(r["credential_type"]) if r["credential_type"] in TYPES else len(TYPES))
+
+
+def query_company_credentials(*, companyId: str) -> dict:
+    """README 9.1: status per credential type and the last round; an unknown company gives an empty list."""
+    run = store().get_run(companyId)
+    return {"companyId": companyId, "credentials": [_status_view(r) for r in _rows_of(companyId)],
+            "run": None if run is None else {
+                "status": run["status"], "credentialTypes": list(run["credential_types"]),
+                "startedAt": _iso(run["started_at"]), "finishedAt": _iso(run.get("finished_at"))}}
+
+
+def list_company_credentials(company_id: str) -> list[dict]:
+    """README 7.1: no messages of the issuer, no routes; onboarding types without a row show `NONE`."""
+    views = {r["credential_type"]: _status_view(r) for r in _rows_of(company_id)}
+    for t in onboarding_types():
+        views.setdefault(t, {"credentialType": t, "status": "NONE", "requestedAt": None, "issuedAt": None,
+                             "revokedAt": None})
+    return [views[t] for t in sorted(views, key=lambda t: TYPES.index(t) if t in TYPES else len(TYPES))]

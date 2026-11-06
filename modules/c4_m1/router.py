@@ -62,3 +62,16 @@ def issuer_callback(credentialKind: str, body: dict = Body(...),
     interface.report_status(credentialKind, bpn, status, message)
     service.audit(claims, "REPORT_CREDENTIAL_STATUS", None, f"{bpn}:{credentialKind.upper()}", 204)
     return Response(status_code=204)
+
+
+@router.get("/internal/companies/{companyId}/credentials")
+def query_credentials(companyId: str,
+                      _: dict = standin.perm(MODULE, "GET", "/internal/companies/{companyId}/credentials")):
+    return interface.query_company_credentials(companyId=companyId)
+
+
+@router.get("/companies/{companyId}/credentials")
+def own_credentials(companyId: str, claims: dict = standin.perm(MODULE, "GET", "/companies/{companyId}/credentials")):
+    """README 7.1; order of checks per 6.5: token, permission, then `company_id` of the token = `companyId`."""
+    standin.company_scope(MODULE, claims, companyId)
+    return service.list_company_credentials(companyId)
