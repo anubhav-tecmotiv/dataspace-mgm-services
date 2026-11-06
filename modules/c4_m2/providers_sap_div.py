@@ -76,10 +76,14 @@ def _access_token() -> str:
         body = response.json()
     except (httpx.HTTPError, ValueError) as error:
         raise common.upstream_error(f"SAP DIV token endpoint: {type(error).__name__}") from error
-    if response.status_code != 200 or not isinstance(body, dict) or "access_token" not in body:
+    if response.status_code != 200 or not isinstance(body, dict) or not isinstance(body.get("access_token"), str):
         raise common.upstream_error(f"SAP DIV token endpoint answered {response.status_code}")
+    try:
+        lifetime = int(body.get("expires_in", 300))
+    except (TypeError, ValueError):
+        lifetime = 300
     with _lock:
-        _token = (body["access_token"], time.time() + int(body.get("expires_in", 300)))
+        _token = (body["access_token"], time.time() + lifetime)
     return body["access_token"]
 
 
