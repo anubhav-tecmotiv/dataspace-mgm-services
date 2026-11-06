@@ -54,6 +54,18 @@ class WalletStore(Protocol):
     def get_secret(self, wallet_id: str, kind: str) -> dict | None: ...
     def delete_secrets(self, wallet_id: str) -> None: ...
 
+    # wallet accounts (`wallet_account`, `wallet_account_credentials`)
+    def get_account(self, technical_user_id: str) -> dict | None: ...
+    def get_account_by_ref(self, wallet_account_ref: str) -> dict | None: ...
+    def put_account(self, account: dict) -> None: ...
+    def list_accounts(self, wallet_id: str | None = None, statuses: list[str] | None = None) -> list[dict]: ...
+    def put_account_credentials(self, wallet_account_id: str, token_url: str, client_id: str,
+                                client_secret_encrypted: bytes, nonce: bytes, key_version: int,
+                                created_at: Any, expires_at: Any) -> None: ...
+    def get_account_credentials(self, wallet_account_id: str) -> dict | None: ...
+    def delete_account_credentials(self, wallet_account_id: str) -> None: ...
+    def pop_account_credentials(self, wallet_account_id: str) -> dict | None: ...
+
     # audit log and step log
     def append_audit(self, entry: dict) -> None: ...
     def list_audit(self) -> list[dict]: ...
@@ -79,6 +91,18 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
+def _when(value: Any) -> dt.datetime:
+    """A sortable UTC time from a datetime or an ISO string (rows may carry either)."""
+    if isinstance(value, str):
+        try:
+            value = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+    if not isinstance(value, dt.datetime):
+        return dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+    return value if value.tzinfo else value.replace(tzinfo=dt.timezone.utc)
+
+
 class InMemoryStore:
     """`WalletStore` in process memory. Thread safe; `transaction` is a re-entrant lock per company."""
 
@@ -91,6 +115,8 @@ class InMemoryStore:
     def _clear(self) -> None:
         self._wallets: dict[str, dict] = {}                          # company_id -> row
         self._secrets: dict[tuple[str, str], dict] = {}              # (wallet_id, kind) -> row
+        self._accounts: dict[str, dict] = {}                         # id (walletAccountRef) -> row
+        self._account_credentials: dict[str, dict] = {}              # wallet_account_id -> row
         self._audit: list[dict] = []
         self._step_log: list[dict] = []
 
@@ -140,6 +166,52 @@ class InMemoryStore:
             for key in [k for k in self._secrets if k[0] == wallet_id]:
                 del self._secrets[key]
 
+    # ------------------------------------------------------------------------- wallet accounts
+    def get_account(self, technical_user_id: str) -> dict | None:
+        """The row with a status other than DELETED, otherwise the latest one (README 7.2 step 2)."""
+        with self._data:
+            rows = [a for a in self._accounts.values() if a.get("technical_user_id") == technical_user_id]
+            if not rows:
+                return None
+            live = [a for a in rows if a.get("status") != "DELETED"]
+            return copy.deepcopy(max(live or rows, key=lambda a: _when(a.get("created_at"))))
+
+    def get_account_by_ref(self, wallet_account_ref: str) -> dict | None:
+        with self._data:
+            return copy.deepcopy(self._accounts.get(wallet_account_ref))
+
+    def put_account(self, account: dict) -> None:
+        with self._data:
+            self._accounts[account["id"]] = copy.deepcopy(account)
+
+    def list_accounts(self, wallet_id: str | None = None, statuses: list[str] | None = None) -> list[dict]:
+        with self._data:
+            return [copy.deepcopy(a) for a in self._accounts.values()
+                    if (wallet_id is None or a.get("wallet_id") == wallet_id)
+                    and (statuses is None or a.get("status") in statuses)]
+
+    def put_account_credentials(self, wallet_account_id: str, token_url: str, client_id: str,
+                                client_secret_encrypted: bytes, nonce: bytes, key_version: int,
+                                created_at: Any, expires_at: Any) -> None:
+        row = {"wallet_account_id": wallet_account_id, "token_url": token_url, "client_id": client_id,
+               "client_secret_encrypted": bytes(client_secret_encrypted), "nonce": bytes(nonce),
+               "key_version": key_version, "created_at": created_at, "expires_at": expires_at}
+        with self._data:
+            self._account_credentials[wallet_account_id] = row
+
+    def get_account_credentials(self, wallet_account_id: str) -> dict | None:
+        with self._data:
+            return copy.deepcopy(self._account_credentials.get(wallet_account_id))
+
+    def delete_account_credentials(self, wallet_account_id: str) -> None:
+        with self._data:
+            self._account_credentials.pop(wallet_account_id, None)
+
+    def pop_account_credentials(self, wallet_account_id: str) -> dict | None:
+        """Read and delete in one step: of two concurrent callers exactly one gets the row (README 7.3)."""
+        with self._data:
+            return self._account_credentials.pop(wallet_account_id, None)
+
     # ------------------------------------------------------------------- audit log and step log
     def append_audit(self, entry: dict) -> None:
         with self._data:
@@ -173,6 +245,8 @@ class InMemoryStore:
                 "wallet_secret": list(self._secrets.values()),
                 "audit_log": self._audit,
                 "step_log": self._step_log,
+                "wallet_account": list(self._accounts.values()),
+                "wallet_account_credentials": list(self._account_credentials.values()),
             })
 
     def reset(self) -> None:
