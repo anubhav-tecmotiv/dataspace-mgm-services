@@ -40,7 +40,6 @@ from portal_common import standin
 from . import interface, service
 from .interface import MODULE
 
-STANDIN = True
 router = standin.router(MODULE)
 
 
