@@ -34,7 +34,7 @@ from fastapi import Body
 
 from portal_common import standin
 
-from . import interface
+from . import interface, service
 from .interface import MODULE
 
 STANDIN = True
@@ -43,6 +43,11 @@ router = standin.router(MODULE)
 
 def reset() -> None:
     interface.reset()
+
+
+def on_startup() -> None:
+    """Start the scheduled tasks of README 6.10."""
+    service.start_timer()
 
 
 @router.post("/steps/create-wallet")

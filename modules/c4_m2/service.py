@@ -81,6 +81,7 @@ def optional_module(name: str) -> ModuleType | None:
 
 def reset() -> None:
     """Stop the timer and clear the store."""
+    stop_timer()
     get_store().reset()
 
 
@@ -454,5 +455,73 @@ def accept_wallet_callback(bpn: str, body: dict, claims: dict | str | None) -> N
             _save(wallet)
             check_did(wallet)              # README 7.6 step 6: the check starts right after the commit
         audit(claims, "SUBMIT_WALLET_CALLBACK", wallet["company_id"], wallet["id"])
+
+
+# -------------------------------------------------------------------------- scheduled tasks
+def _timer_pass_requested(moment: dt.datetime) -> None:
+    """README 6.10 callback deadline: `REQUESTED` with an order older than the deadline."""
+    deadline = dt.timedelta(minutes=_number("PROVIDER_CALLBACK_TIMEOUT_MINUTES", 1440))
+    store = get_store()
+    for candidate in store.list_wallets(["REQUESTED"]):
+        ordered = _when(candidate.get("provider_ordered_at"))
+        if ordered is None or moment - ordered <= deadline:
+            continue
+        with store.transaction(candidate["company_id"]):
+            wallet = store.get_wallet(candidate["company_id"])
+            if wallet and wallet["status"] == "REQUESTED" and _when(wallet.get("provider_ordered_at")) == ordered:
+                _fail(wallet, "PROVIDER_TIMEOUT")
+
+
+def _timer_pass_validating(moment: dt.datetime) -> None:
+    """README 6.10 DID check: `VALIDATING`, no `did_validated_at`, `next_check_at` reached."""
+    store = get_store()
+    for candidate in store.list_wallets(["VALIDATING"]):
+        due = _when(candidate.get("next_check_at"))
+        if candidate.get("did_validated_at") or due is None or due > moment:
+            continue
+        with store.transaction(candidate["company_id"]):
+            wallet = store.get_wallet(candidate["company_id"])
+            if wallet and wallet["status"] == "VALIDATING" and not wallet.get("did_validated_at"):
+                check_did(wallet)
+
+
+def run_timer_once() -> None:
+    """One pass of every scheduled task (README 6.10). The background thread calls it every
+    `TIMER_INTERVAL_SECONDS`; tests call it directly."""
+    moment = now()
+    _timer_pass_requested(moment)
+    _timer_pass_validating(now())
+    accounts = optional_module("accounts")
+    if accounts is not None and hasattr(accounts, "run_tasks"):
+        accounts.run_tasks()
+
+
+_timer: threading.Thread | None = None
+_timer_stop = threading.Event()
+
+
+def _timer_loop(stop: threading.Event) -> None:
+    while not stop.wait(_number("TIMER_INTERVAL_SECONDS", 60)):
+        try:
+            run_timer_once()
+        except Exception:  # noqa: BLE001 - a failing pass must not end the timer
+            log.exception("scheduled tasks of C4-M2 failed")
+
+
+def start_timer() -> None:
+    """Start the background thread of the scheduled tasks if it is not running."""
+    global _timer, _timer_stop
+    if _timer is not None and _timer.is_alive():
+        return
+    _timer_stop = threading.Event()
+    _timer = threading.Thread(target=_timer_loop, args=(_timer_stop,), name="c4-m2-timer", daemon=True)
+    _timer.start()
+
+
+def stop_timer() -> None:
+    """Stop the background thread (used by `reset()`)."""
+    global _timer
+    _timer_stop.set()
+    _timer = None
 
 
