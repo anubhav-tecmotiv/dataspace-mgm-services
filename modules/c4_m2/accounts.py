@@ -256,3 +256,50 @@ def create_wallet_account(input: dict) -> dict:
             account = _save(_new_account(technical_user_id, company_id, wallet))
         account = _order(account, wallet)
         return _reply(input, "create-wallet-account", state, account)
+
+
+# ------------------------------------------------------------------------- delete-wallet-account
+def _order_deletion(account: dict) -> dict:
+    """README 8.3 step 4 for SAP DIV: the order goes out; `deletion_ordered_at` only after it was accepted."""
+    wallet = service.get_wallet(account["company_id"])
+    answer = providers.get(account["provider"]).order_account_deletion({
+        "bpn": wallet["bpn"] if wallet else "", "technical_user_id": account["technical_user_id"],
+        "wallet_account_ref": account["id"], "provider_name": account["provider_name"]})
+    account = service.get_store().get_account_by_ref(account["id"]) or account
+    if answer["result"] == "DELETED":
+        return _delete(account)
+    account["deletion_ordered_at"] = account.get("deletion_ordered_at") or service.now()
+    return _save(account)
+
+
+def delete_wallet_account(input: dict) -> dict:
+    """Step `delete-wallet-account` (README 8.3). The status of the company does not matter."""
+    technical_user_id, company_id = _validate(input)
+    reference = input.get("walletAccountRef")
+    if reference is not None:
+        _uuid(reference, "walletAccountRef")
+    with _lock(technical_user_id):
+        account = service.get_store().get_account(technical_user_id)
+        if account is not None and account["status"] == REQUESTED:
+            raise _problem(409, "invalid-state", "the wallet account is not complete yet")
+        if reference is not None and account is not None and account["id"] != reference:
+            raise _problem(409, "conflict", "walletAccountRef is not the current wallet account of the technical user")
+        if account is None:
+            service.log_step(input, "delete-wallet-account", technical_user_id, "DONE")
+            return {"stepRunId": input["stepRunId"], "state": "DONE",
+                    "result": {"technicalUserId": technical_user_id, "companyId": company_id, "status": DELETED}}
+        if account["status"] == DELETED:
+            return _reply(input, "delete-wallet-account", "DONE", account)
+        if account["company_id"] != company_id:
+            raise _problem(409, "conflict", "the wallet account belongs to another company")
+        if account["status"] == FAILED:
+            account = _delete(account)
+        elif providers.get(account["provider"]).deletion_is_async:
+            if account["status"] == ACTIVE:
+                account["status"] = DELETING
+                _save(account)
+            if not account.get("deletion_ordered_at"):
+                account = _order_deletion(account)
+        else:
+            account = _order_deletion(account)
+        return _reply(input, "delete-wallet-account", "RUNNING", account)
