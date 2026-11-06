@@ -35,12 +35,27 @@ import os
 from portal_common import csp, events, neighbours, standin
 from portal_common.problems import Problem
 
+from . import crypto, service
+from .store import WalletStore
+
 MODULE = "c4-m2"
 wallets: dict[str, dict] = {}
 
 
+def store() -> WalletStore:
+    """The active store."""
+    return service.get_store()
+
+
 def reset() -> None:
+    """Clear the store, the key cache and the helpers of the providers and accounts files, if they exist."""
     wallets.clear()
+    service.reset()
+    crypto.reset()
+    for name in ("providers", "accounts"):
+        module = service.optional_module(name)
+        if module is not None and hasattr(module, "reset"):
+            module.reset()
 
 
 def create_wallet(input: dict) -> dict:
