@@ -30,10 +30,20 @@ separate file); if that file does not exist yet, the configured bases are used d
 """
 from __future__ import annotations
 
+import json
+import logging
 import os
-from urllib.parse import urlsplit
+from pathlib import Path
+from urllib.parse import unquote, urlsplit
+
+import httpx
+
+from portal_common import http
 
 from . import service
+
+log = logging.getLogger(__name__)
+RESOLVE_TIMEOUT_SECONDS = 10.0
 
 INVALID_DID_DOCUMENT = "INVALID_DID_DOCUMENT"
 CREDENTIAL_SERVICE = "CredentialService"
@@ -104,3 +114,83 @@ def check_document(provider: str, did: str, document: dict) -> str | None:
     if provider in _PROVIDERS_WITH_CREDENTIAL_SERVICE and not _has_credential_service(document):
         return INVALID_DID_DOCUMENT
     return None
+
+
+# ------------------------------------------------------------------------------------- resolution
+def _host_and_path(did: str) -> tuple[str, list[str]]:
+    """Host and path segments of a `did:web` DID (`%3A` in the host is a port separator)."""
+    parts = did.split(":")[2:]
+    host = unquote(parts[0]).lower() if parts else ""
+    return host, [unquote(part) for part in parts[1:]]
+
+
+def _from_test_directory(did: str) -> dict | None:
+    """README 4, 11.4: `TEST_DID_DOCUMENTS_DIR/<host>.json` is used before any other resolution."""
+    directory = os.environ.get("TEST_DID_DOCUMENTS_DIR", "").strip()
+    host, _ = _host_and_path(did)
+    if not directory or not host:
+        return None
+    path = Path(directory) / f"{host}.json"
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return document if isinstance(document, dict) else None
+
+
+def _from_stand_in_providers(did: str) -> dict | None:
+    providers = service.optional_module("providers")
+    if providers is None:
+        return None
+    documents = providers.stand_in_documents()
+    if did in documents:
+        return documents[did]
+    wanted = did.lower()
+    return next((doc for known, doc in documents.items() if known.lower() == wanted), None)
+
+
+def _from_resolver(base_url: str, did: str) -> dict | None:
+    """README 11.4: `GET {DID_RESOLVER_URL}/1.0/identifiers/{did}`; success on 2xx and an empty
+    `didResolutionMetadata.error`, the document is in `didDocument`."""
+    try:
+        response = http.request("GET", f"{base_url.rstrip('/')}/1.0/identifiers/{did}",
+                                timeout=RESOLVE_TIMEOUT_SECONDS)
+        if not 200 <= response.status_code < 300:
+            return None
+        body = response.json()
+    except (httpx.HTTPError, ValueError):
+        log.info("DID resolver not reachable or unreadable for %s", did)
+        return None
+    if not isinstance(body, dict) or (body.get("didResolutionMetadata") or {}).get("error"):
+        return None
+    document = body.get("didDocument")
+    return document if isinstance(document, dict) else None
+
+
+def _from_did_web(did: str) -> dict | None:
+    """README 11.4: `https://<host>/<path>/did.json` or `https://<host>/.well-known/did.json`, HTTPS only."""
+    host, path = _host_and_path(did)
+    if not did.lower().startswith("did:web:") or not host:
+        return None
+    url = f"https://{host}/{'/'.join(path)}/did.json" if path else f"https://{host}/.well-known/did.json"
+    try:
+        response = http.request("GET", url, timeout=RESOLVE_TIMEOUT_SECONDS)
+        document = response.json() if response.status_code == 200 else None
+    except (httpx.HTTPError, ValueError):
+        log.info("did:web document not reachable for %s", did)
+        return None
+    return document if isinstance(document, dict) else None
+
+
+def resolve(did: str) -> dict | None:
+    """The DID document of `did`, or None if it cannot be resolved now (README 6.4 step 2).
+
+    Order: files of `TEST_DID_DOCUMENTS_DIR`; then `DID_RESOLVER_URL` if set, otherwise the documents
+    of the stand-in providers and the built-in `did:web` resolution."""
+    document = _from_test_directory(did)
+    if document is not None:
+        return document
+    resolver = os.environ.get("DID_RESOLVER_URL", "").strip()
+    if resolver:
+        return _from_resolver(resolver, did)
+    return _from_stand_in_providers(did) or _from_did_web(did)
