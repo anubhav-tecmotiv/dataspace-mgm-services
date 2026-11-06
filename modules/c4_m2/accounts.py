@@ -303,3 +303,41 @@ def delete_wallet_account(input: dict) -> dict:
         else:
             account = _order_deletion(account)
         return _reply(input, "delete-wallet-account", "RUNNING", account)
+
+
+# ------------------------------------------------------------------------------ SAP DIV callbacks
+def _callback_account(reference: str) -> dict:
+    account = service.get_store().get_account_by_ref(reference)
+    if account is None:
+        raise _problem(404, "not-found", "no wallet account with this externalId")
+    return account
+
+
+def accept_account_created(reference: str, body: dict, claims: dict | str | None) -> None:
+    """README 7.6 `POST /callbacks/sap-div/technical-users/{externalId}`; the route answers 204. Every accepted
+    callback, also a duplicate, is audited."""
+    details = body if isinstance(body, dict) else {}
+    for name in ("authenticationServiceUrl", "clientID", "clientSecret"):
+        if not isinstance(details.get(name), str) or not details[name]:
+            raise _problem(400, "validation", f"{name} is required")
+    found = _callback_account(reference)
+    with _lock(found["technical_user_id"]):
+        account = _callback_account(reference)
+        if account["status"] == REQUESTED:
+            _activate(account, details["authenticationServiceUrl"].rstrip("/") + "/oauth/token",
+                      details["clientID"], details["clientSecret"])
+        elif account["status"] != ACTIVE:
+            raise _problem(409, "invalid-state", "the wallet account is not waiting for this callback")
+        service.audit(claims, "SUBMIT_WALLET_ACCOUNT_CALLBACK", account["company_id"], account["id"])
+
+
+def accept_account_deleted(reference: str, claims: dict | str | None) -> None:
+    """README 7.6 `POST /callbacks/sap-div/technical-users/{externalId}/delete`; the route answers 204."""
+    found = _callback_account(reference)
+    with _lock(found["technical_user_id"]):
+        account = _callback_account(reference)
+        if account["status"] == DELETING:
+            _delete(account)
+        elif account["status"] != DELETED:
+            raise _problem(409, "invalid-state", "the wallet account is not being deleted")
+        service.audit(claims, "SUBMIT_WALLET_ACCOUNT_CALLBACK", account["company_id"], account["id"])
