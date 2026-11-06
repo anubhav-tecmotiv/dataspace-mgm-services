@@ -376,3 +376,83 @@ def create_wallet(input: dict) -> dict:
         return {"stepRunId": input["stepRunId"], "state": state, "result": _step_result(wallet)}
 
 
+# --------------------------------------------------------------------------- SAP DIV callbacks
+def _callback_body_problem(body: Any) -> str | None:
+    """Why a callback body is malformed (openapi `SapDivWalletCallback`), None if it is complete."""
+    if not isinstance(body, dict) or not isinstance(body.get("did"), str) or not body["did"]:
+        return "did is required"
+    if not isinstance(body.get("didDocument"), dict):
+        return "didDocument is required"
+    details = body.get("authenticationDetails")
+    if not isinstance(details, dict):
+        return "authenticationDetails is required"
+    for name in ("authenticationServiceUrl", "clientID", "clientSecret"):
+        if not isinstance(details.get(name), str) or not details[name]:
+            return f"authenticationDetails.{name} is required"
+    return None
+
+
+def _callback_document_valid(document: dict) -> bool:
+    """README 7.6 step 4: schema of Portal 2.6.0, `@context` list, `id`, `service` list with `id` and `type`,
+    `verificationMethod` list with `id`, `type` and `publicKeyJwk` with `kty`, `crv`, `x`, `y`."""
+    def text(value: Any) -> bool:
+        return isinstance(value, str) and value != ""
+    if not isinstance(document.get("@context"), list) or not text(document.get("id")):
+        return False
+    services, methods = document.get("service"), document.get("verificationMethod")
+    if not isinstance(services, list) or not isinstance(methods, list):
+        return False
+    if not all(isinstance(e, dict) and text(e.get("id")) and e.get("type") for e in services):
+        return False
+    for method in methods:
+        jwk = method.get("publicKeyJwk") if isinstance(method, dict) else None
+        if not (text(method.get("id")) if isinstance(method, dict) else False) or not method.get("type") \
+                or not isinstance(jwk, dict) or not all(text(jwk.get(k)) for k in ("kty", "crv", "x", "y")):
+            return False
+    return True
+
+
+def _sap_div_location(bpn: str, did_value: str) -> str | None:
+    base = os.environ.get("SAP_DIV_DID_DOCUMENT_BASE_URL", "").strip().rstrip("/")
+    return f"{base}/{bpn}/did.json" if base else _did_web_location(did_value)
+
+
+def accept_wallet_callback(bpn: str, body: dict, claims: dict | str | None) -> None:
+    """The wallet callback of SAP DIV (README 7.6 steps 1 to 6). Returns None (the route answers 204);
+    raises `Problem` for 400, 404 and 409. Every accepted callback, also a duplicate, is audited."""
+    problem = _callback_body_problem(body)
+    if problem:
+        raise _problem(400, "validation", problem)
+    store = get_store()
+    found = store.find_wallet_by_bpn(bpn)
+    if found is None or found["provider"] != "SAP_DIV":
+        raise _problem(404, "not-found", "no SAP DIV wallet for this BPN")
+    with store.transaction(found["company_id"]):
+        wallet = store.get_wallet(found["company_id"])
+        if wallet is None or wallet["provider"] != "SAP_DIV":
+            raise _problem(404, "not-found", "no SAP DIV wallet for this BPN")
+        announced = body["did"]
+        if wallet["status"] in ("VALIDATING", "ACTIVE"):
+            if (wallet.get("did") or "").lower() != announced.lower():
+                raise _problem(409, "conflict", "the wallet already has another DID")
+        elif wallet["status"] != "REQUESTED":
+            raise _problem(409, "invalid-state", "the wallet is not waiting for a callback; a new attempt is needed")
+        elif not did.check_form("SAP_DIV", announced, wallet["bpn"]):
+            _fail(wallet, "DID_MISMATCH")
+        elif not _callback_document_valid(body["didDocument"]):
+            _fail(wallet, did.INVALID_DID_DOCUMENT)
+        else:
+            details = body["authenticationDetails"]
+            _store_secret(wallet["id"], HOLDER_ACCESS, {"url": details["authenticationServiceUrl"],
+                                                        "client_id": details["clientID"],
+                                                        "secret": details["clientSecret"]})
+            moment = now()
+            wallet.update(status="VALIDATING", did=announced,
+                          did_document_location=_sap_div_location(wallet["bpn"], announced),
+                          credential_service_url=credential_service_url(body["didDocument"]),
+                          validating_since=moment, next_check_at=moment)
+            _save(wallet)
+            check_did(wallet)              # README 7.6 step 6: the check starts right after the commit
+        audit(claims, "SUBMIT_WALLET_CALLBACK", wallet["company_id"], wallet["id"])
+
+
