@@ -341,3 +341,83 @@ def accept_account_deleted(reference: str, claims: dict | str | None) -> None:
         elif account["status"] != DELETED:
             raise _problem(409, "invalid-state", "the wallet account is not being deleted")
         service.audit(claims, "SUBMIT_WALLET_ACCOUNT_CALLBACK", account["company_id"], account["id"])
+
+
+# ------------------------------------------------------------------------------ credentials (7.3)
+def retrieve_credentials(technical_user_id: str, claims: dict) -> dict:
+    """`POST /technical-users/{id}/wallet-account/credentials` (README 7.3): hands the credentials out exactly
+    once. Reading, deleting the row, `RETRIEVED` and the audit entry happen under the lock of the technical user."""
+    store = service.get_store()
+    with _lock(technical_user_id):
+        account = _current(technical_user_id)
+        if not claims.get("company_id") or claims["company_id"] != account["company_id"]:
+            raise _problem(404, "not-found", "no wallet account for this technical user")
+        if account["status"] != ACTIVE:
+            raise _problem(409, "invalid-state", "the wallet account is not ACTIVE")
+        state = account["credentials_state"]
+        if state == RETRIEVED:
+            raise _problem(410, "already-retrieved", "the credentials were retrieved already")
+        if state == EXPIRED:
+            raise _problem(410, "credentials-expired", "the credentials were deleted after the retention period")
+        if state != AVAILABLE:
+            raise _problem(409, "no-credentials", "the wallet account has no credentials to retrieve")
+        row = store.pop_account_credentials(account["id"])
+        if row is None:
+            raise _problem(410, "already-retrieved", "the credentials were retrieved already")
+        secret = crypto.decrypt(row["client_secret_encrypted"], row["nonce"], row["key_version"])
+        account["credentials_state"] = RETRIEVED
+        _save(account)
+        service.audit(claims, "RETRIEVE_WALLET_CREDENTIALS", account["company_id"], account["id"])
+        wallet = service.get_wallet(account["company_id"]) or {}
+        return {"walletAccountRef": account["id"], "tokenUrl": row["token_url"], "clientId": row["client_id"],
+                "clientSecret": secret, "did": wallet.get("did"),
+                "credentialServiceUrl": wallet.get("credential_service_url")}
+
+
+# ------------------------------------------------------------------------------ scheduled tasks
+def _deadline_passed(candidate: dict, field: str, moment: dt.datetime) -> bool:
+    ordered = _aware(candidate.get(field))
+    return ordered is not None and moment - ordered > dt.timedelta(
+        minutes=_number("PROVIDER_CALLBACK_TIMEOUT_MINUTES", 1440))
+
+
+def _task_callback_deadline(moment: dt.datetime) -> None:
+    """README 6.10: an order older than the deadline. `REQUESTED` becomes `FAILED` (`PROVIDER_TIMEOUT`);
+    `DELETING` stays and `WalletAccountDeletionFailed` is published once (open question: no repetition)."""
+    store = service.get_store()
+    for candidate in store.list_accounts(statuses=[REQUESTED, DELETING]):
+        field = "provider_ordered_at" if candidate["status"] == REQUESTED else "deletion_ordered_at"
+        if not _deadline_passed(candidate, field, moment):
+            continue
+        with _lock(candidate["technical_user_id"]):
+            account = store.get_account_by_ref(candidate["id"])
+            if account is None or account["status"] != candidate["status"]:
+                continue
+            if account["status"] == REQUESTED:
+                _fail(account, "PROVIDER_TIMEOUT")
+            elif not account.get("deletion_failed_at"):
+                account["deletion_failed_at"] = moment
+                _save(account)
+                _publish("WalletAccountDeletionFailed", account, reason="PROVIDER_TIMEOUT")
+
+
+def _task_credentials_retention(moment: dt.datetime) -> None:
+    """README 6.10, 6.7: credentials that were not retrieved are deleted once `expires_at` is reached."""
+    store = service.get_store()
+    for candidate in store.list_accounts():
+        row = store.get_account_credentials(candidate["id"]) if candidate["credentials_state"] == AVAILABLE else None
+        expires = _aware(row["expires_at"]) if row else None
+        if expires is None or expires > moment:
+            continue
+        with _lock(candidate["technical_user_id"]):
+            account = store.get_account_by_ref(candidate["id"])
+            if account is not None and account["credentials_state"] == AVAILABLE:
+                store.delete_account_credentials(account["id"])
+                account["credentials_state"] = EXPIRED
+                _save(account)
+
+
+def run_tasks() -> None:
+    """The account part of the scheduled tasks; `service.run_timer_once()` calls it."""
+    _task_callback_deadline(service.now())
+    _task_credentials_retention(service.now())
