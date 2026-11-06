@@ -20,97 +20,139 @@
 #  that the code is correct.
 #
 #  SPDX-License-Identifier: Apache-2.0 AND CC0-1.0
-#  Assisted-By: OpenCode (DeepSeek V4.1 Flash Free)
+#  Assisted-By: Claude Code (claude-sonnet-5-5)
 #################################################################################
-"""C4-M2 Dataspace Wallet Interface — wallet account management.
+"""Wallet accounts of C4-M2 (README 5, 6.3, 6.7, 6.10, 7.2, 7.3, 7.6, 8.2, 8.3, 9.2, 10).
 
-This module owns the five account routes and the account/retention tasks that
-Person A's timer calls (TEAM3-PLAN §14.2 rule 4).  It is package‑free: imported
-by `interface.py`, `router.py` and the test suite through the `seam(...)` helper.
-
-The built‑in stand‑ins for account creation/deletion are defined here so that
-the test suite can call `seam("modules.c4_m2.accounts").create_wallet_account(...)`
-etc. without touching the real middleware.
-
-Milestone M0 — skeleton only (no implementation, no stubs).
+A wallet account is the access of a technical user to the dataspace wallet of its company. The steps
+`create-wallet-account` and `delete-wallet-account` are long-running: they answer `RUNNING` when the account was not
+complete at the time of the call and the end is reported by an event (README 6.9). Steps and callbacks of one
+technical user never run at the same time (a lock per technical user, README 6.9). Time is read only through
+`service.now()` at call time. The wallet, the company, the clock, the audit log and the encryption belong to the
+core (`service.py`, `crypto.py`); the providers are asked through `providers.get(...)`.
 """
 from __future__ import annotations
 
+import contextlib
+import datetime as dt
+import os
+import uuid
+from typing import Any
 
-# ----------------------------------------------------------------------
-# Public API — the test suite reaches these names through `seam(...)`.
-# Do NOT rename without also updating `test_c4_m2_accounts.py` (TEAM3-PLAN §12.1 rule 1).
-# ----------------------------------------------------------------------
+from portal_common import events
+from portal_common.problems import Problem
 
+from . import crypto, providers, service
 
-def create_wallet_account(company_id: str, provider: str, technical_user_id: str | None = None) -> None:
-    """Create a wallet account for the given company and provider.
-
-    The test suite drives time manually with ``service.now()`` and
-    ``service.run_timer_once()``, so this function is a no‑op at the skeleton
-    stage.  Full implementation creates a ``WalletAccount`` row, writes an
-    audit entry and emits a ``WalletAccountCreated`` event.
-    """
-    raise NotImplementedError
+MODULE = "c4-m2"
+REQUESTED, ACTIVE, FAILED, DELETING, DELETED = "REQUESTED", "ACTIVE", "FAILED", "DELETING", "DELETED"
+NONE, AVAILABLE, RETRIEVED, EXPIRED = "NONE", "AVAILABLE", "RETRIEVED", "EXPIRED"
 
 
-def delete_wallet_account(company_id: str, provider: str, technical_user_id: str | None = None) -> None:
-    """Delete a wallet account for the given company and provider.
-
-    Skeleton raises ``NotImplementedError``; the final implementation removes
-    the ``WalletAccount`` row, writes an audit entry and emits a
-    ``WalletAccountDeleted`` event.
-    """
-    raise NotImplementedError
+# --------------------------------------------------------------------------------------- helpers
+def _problem(status: int, name: str, detail: str | None = None, retryable: bool = False) -> Problem:
+    return Problem(MODULE, status, name, detail=detail, retryable=retryable)
 
 
-def get_wallet_account_internal(company_id: str, provider: str) -> None:
-    """Look up a wallet account by company and provider.
-
-    Skeleton returns ``None``; the full implementation returns the row or
-    ``404`` if the account does not exist.
-    """
-    raise NotImplementedError
-
-
-def run_tasks() -> None:
-    """Run the account retention / deletion timer tasks.
-
-    Called by ``service.run_timer_once()`` (Person A's timer thread).  The
-    skeleton is a no‑op; the full implementation checks ``expires_at`` /
-    ``deletion_ordered_at`` and either renews the account or deletes it.
-    """
-    raise NotImplementedError
+def _number(name: str, default: float) -> float:
+    """A positive number from the environment at call time; the default for unset or unusable values."""
+    try:
+        value = float(os.environ.get(name, "").strip())
+    except ValueError:
+        return default
+    return value if value > 0 else default
 
 
-def reset() -> None:
-    """Clear all internal account state.
-
-    Called at the start of each test to guarantee isolation.
-    """
-    raise NotImplementedError
-
-
-# ----------------------------------------------------------------------
-# Lazy‑load helpers used by the test suite's `seam(...)` calls.
-# The test suite imports these through `seam("modules.c4_m2.accounts")`.
-# ----------------------------------------------------------------------
+def _aware(value: Any) -> dt.datetime | None:
+    if isinstance(value, str):
+        try:
+            value = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(value, dt.datetime):
+        return None
+    return value if value.tzinfo else value.replace(tzinfo=dt.timezone.utc)
 
 
-def __getattr__(name: str):
-    """Make ``seam("modules.c4_m2.accounts").create_wallet_account(...)`` etc. work.
+def _iso(value: Any) -> str | None:
+    moment = _aware(value)
+    return moment.isoformat() if moment else None
 
-    This function is only reached when the test suite lazily imports the
-    module via the seam helper; it is not a normal import path.
-    """
-    if name == "create_wallet_account":
-        return create_wallet_account
-    if name == "delete_wallet_account":
-        return delete_wallet_account
-    if name == "get_wallet_account_internal":
-        return get_wallet_account_internal
-    if name == "run_tasks":
-        return run_tasks
-    if name == "reset":
-        return reset
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+def _lock(technical_user_id: str) -> contextlib.AbstractContextManager:
+    """README 6.9: one writer per technical user (the in-memory stand-in of the advisory lock)."""
+    return service.get_store().transaction(f"technical-user:{technical_user_id}")
+
+
+def _uuid(value: Any, name: str) -> str:
+    try:
+        if not isinstance(value, str):
+            raise ValueError
+        uuid.UUID(value)
+    except ValueError:
+        raise _problem(400, "validation", f"{name} must be a UUID") from None
+    return value
+
+
+def _validate(input: dict) -> tuple[str, str]:
+    """README 8.2, 8.3 input: `processId`, `stepRunId`, `technicalUserId`, `companyId`; returns the last two."""
+    if not isinstance(input, dict):
+        raise _problem(400, "validation", "the input must be a JSON object")
+    for name in ("processId", "stepRunId"):
+        _uuid(input.get(name), name)
+    return _uuid(input.get("technicalUserId"), "technicalUserId"), _uuid(input.get("companyId"), "companyId")
+
+
+def _save(account: dict) -> dict:
+    account["changed_at"] = service.now()
+    service.get_store().put_account(account)
+    return account
+
+
+def _result(account: dict) -> dict:
+    """README 8.2 and 8.3 result (openapi `StepResultWalletAccount`); no secrets."""
+    result = {"walletAccountRef": account["id"], "technicalUserId": account["technical_user_id"],
+              "companyId": account["company_id"], "provider": account["provider"], "status": account["status"]}
+    if account.get("failure_reason"):
+        result["failureReason"] = account["failure_reason"]
+    return result
+
+
+def _reply(input: dict, step: str, state: str, account: dict) -> dict:
+    service.log_step(input, step, account["id"], state)
+    return {"stepRunId": input["stepRunId"], "state": state, "result": _result(account)}
+
+
+# ------------------------------------------------------------------------------------------ views
+def _view(account: dict) -> dict:
+    """README 7.2 and 9.2 body (openapi `WalletAccount`): the state of the credentials, never the credentials."""
+    expires = None
+    if account.get("credentials_state") == AVAILABLE:
+        row = service.get_store().get_account_credentials(account["id"])
+        expires = _iso(row["expires_at"]) if row else None
+    return {"walletAccountRef": account["id"], "technicalUserId": account["technical_user_id"],
+            "companyId": account["company_id"], "provider": account["provider"], "status": account["status"],
+            "failureReason": account.get("failure_reason"), "credentialsState": account["credentials_state"],
+            "credentialsExpireAt": expires, "createdAt": _iso(account.get("created_at")),
+            "changedAt": _iso(account.get("changed_at"))}
+
+
+def _current(technical_user_id: str) -> dict:
+    """README 7.2 step 2: the row with a status other than `DELETED`, otherwise the latest; none is 404."""
+    account = service.get_store().get_account(technical_user_id)
+    if account is None:
+        raise _problem(404, "not-found", "no wallet account for this technical user")
+    return account
+
+
+def get_wallet_account_internal(*, technicalUserId: str) -> dict:
+    """Query `getWalletAccountInternal` (README 9.2): as 7.2, without the check of the company."""
+    return _view(_current(technicalUserId))
+
+
+def view_wallet_account(technical_user_id: str, claims: dict) -> dict:
+    """`GET /technical-users/{id}/wallet-account` (README 7.2): another company's account stays invisible (404)."""
+    account = _current(technical_user_id)
+    if not claims.get("company_id") or claims["company_id"] != account["company_id"]:
+        raise _problem(404, "not-found", "no wallet account for this technical user")
+    return _view(account)
