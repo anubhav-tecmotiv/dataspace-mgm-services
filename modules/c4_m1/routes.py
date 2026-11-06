@@ -100,6 +100,7 @@ class StubRoute:
         self._lock = threading.Lock()
         self.orders: list[dict] = []
         self._pending: list[dict] = []     # {"order", "timer", "fired"}
+        self._timers: list[threading.Timer] = []   # every started timer, so that flush() can wait for them
         self._generation = 0
 
     def prepare(self, ctx: dict) -> None:
@@ -118,6 +119,7 @@ class StubRoute:
             entry["timer"] = threading.Timer(delay, self._fire, args=(entry,))
             entry["timer"].daemon = True
             self._pending.append(entry)
+            self._timers.append(entry["timer"])
             entry["timer"].start()
         return f"stub-{attempt}", None
 
@@ -133,21 +135,29 @@ class StubRoute:
         fail = {t.strip().upper() for t in os.environ.get("STUB_ISSUER_FAIL_TYPES", "").split(",") if t.strip()}
         failing = order["credential_type"] in fail
         try:
-            service.report_status(order["credential_type"].lower(), order["bpn"],
-                                  "UNSUCCESSFUL" if failing else "SUCCESSFUL",
-                                  "Issuance declined by the stand-in" if failing else None)
+            # Wait for a step that is still ordering this company: with a delay of 0 the timer fires before the
+            # row of the order is stored, and the report would find no order (README 6.9 per-company lock).
+            with service.store().transaction(order["company_id"]):
+                service.report_status(order["credential_type"].lower(), order["bpn"],
+                                      "UNSUCCESSFUL" if failing else "SUCCESSFUL",
+                                      "Issuance declined by the stand-in" if failing else None)
         except Problem as e:   # for example the row is gone after a reset
             log.warning("stand-in report for %s/%s not processed: %s", order["bpn"], order["credential_type"], e)
 
     def flush(self) -> None:
-        """Fires every pending timer at once, in order of the orders (tests)."""
+        """Fires every pending timer at once, in order of the orders, and waits for timers that already
+        fired in their own thread (tests)."""
         while True:
             with self._lock:
                 entry = next((e for e in self._pending if not e["fired"]), None)
             if entry is None:
-                return
+                break
             entry["timer"].cancel()
             self._fire(entry)
+        with self._lock:
+            started = list(self._timers)
+        for timer in started:
+            timer.join(5)
 
     def cancel(self, row: dict) -> None:
         """An open order is cancelled: nothing to do at the stand-in (a late report revokes at once)."""
@@ -161,6 +171,7 @@ class StubRoute:
             for e in self._pending:
                 e["timer"].cancel()
             self._pending.clear()
+            self._timers.clear()
             self.orders.clear()
 
 
