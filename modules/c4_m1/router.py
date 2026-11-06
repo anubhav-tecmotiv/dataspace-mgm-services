@@ -49,6 +49,11 @@ def issue(body: dict = Body(...), _: dict = standin.perm(MODULE, "POST", "/steps
     return interface.issue_credentials(body)
 
 
+@router.post("/steps/revoke-credentials")
+def revoke(body: dict = Body(...), _: dict = standin.perm(MODULE, "POST", "/steps/revoke-credentials")):
+    return interface.revoke_credentials(body)
+
+
 @router.post("/issuer-callbacks/{credentialKind}", status_code=204, response_class=Response)
 def issuer_callback(credentialKind: str, body: dict = Body(...),
                     claims: dict = standin.perm(MODULE, "POST", "/issuer-callbacks/{credentialKind}")):

@@ -224,6 +224,47 @@ def _order(ctx: dict, route, row: dict | None, ctype: str) -> None:
     _change(new, "REQUESTED")
 
 
+# ------------------------------------------------------------------------------------ revoke-credentials
+def revoke_credentials(input: dict) -> dict:
+    """README 8.2. No precondition on company or wallet; per given type (default MEMBERSHIP): `ISSUED` is revoked
+    through the route of the order (or waits for OSP staff), `REQUESTED`/`FAILED` become `CANCELLED`."""
+    from portal_common import standin
+    cid = valid_uuid(input.get("companyId"), "companyId")
+    reason = input.get("reason")
+    if reason not in ("COMPANY_DEACTIVATED", "OTHER"):
+        raise _validation("reason must be COMPANY_DEACTIVATED or OTHER")
+    types = valid_types(input.get("credentialTypes"), ["MEMBERSHIP"])
+    revoked: list[str] = []
+    cancelled: list[str] = []
+    manual: list[str] = []
+    with store().transaction(cid):
+        for t in types:
+            row = store().get_credential(cid, t)
+            if row is None:
+                continue
+            if row["status"] == "ISSUED":
+                if routes.get(row["route"]).revoke(row):
+                    _change(row, "REVOKED", revoked_at=now(), revocation_reason=reason)
+                    events.publish(MODULE, "CredentialRevoked", {"companyId": cid, "credentialType": t,
+                                                                  "revocationReason": reason})
+                    revoked.append(t)
+                else:
+                    _change(row, "REVOCATION_PENDING", revocation_reason=reason)
+                    manual.append(t)
+            elif row["status"] in ("REQUESTED", "FAILED"):
+                routes.get(row["route"]).cancel(row)
+                _change(row, "CANCELLED", revocation_reason=reason)
+                cancelled.append(t)
+            elif row["status"] == "REVOCATION_PENDING":
+                manual.append(t)
+        run = store().get_run(cid)
+        if run and run["status"] == "RUNNING" and set(run["credential_types"]) & set(types):
+            run.update(status="CANCELLED", finished_at=now())
+            store().put_run(run)
+    return standin.step_reply(input, {"companyId": cid, "revoked": revoked, "cancelled": cancelled,
+                                      "manualRevocation": manual})
+
+
 # -------------------------------------------------------------------------------------- status report
 def report_status(kind: str, bpn: str, status: str, message: str | None = None) -> None:
     """README 7.4 steps 3 and 4 (the HTTP layer checks token and input and writes the audit entry)."""
