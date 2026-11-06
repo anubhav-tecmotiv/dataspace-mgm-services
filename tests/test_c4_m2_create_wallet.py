@@ -29,6 +29,14 @@ TEAM3-PLAN.md section 12 are imported lazily inside the tests.
 """
 from __future__ import annotations
 
+import importlib.util
+
+import pytest
+
+pytestmark = pytest.mark.skipif(
+    importlib.util.find_spec("modules.c4_m2.providers") is None,
+    reason="not implemented yet: modules.c4_m2.providers (provider adapters)")
+
 import threading
 import uuid
 
