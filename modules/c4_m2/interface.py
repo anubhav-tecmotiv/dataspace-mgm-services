@@ -58,7 +58,20 @@ def reset() -> None:
             module.reset()
 
 
+def _implemented() -> bool:
+    """The real implementation needs the provider adapters (providers.py). Until that file exists in the
+    module, the stand-in below answers, so that the flows of demo.py keep working."""
+    return service.providers_module() is not None
+
+
 def create_wallet(input: dict) -> dict:
+    """Step `create-wallet` (README 8.1)."""
+    if _implemented():
+        return service.create_wallet(input)
+    return _standin_create_wallet(input)
+
+
+def _standin_create_wallet(input: dict) -> dict:
     cid = input.get("companyId")
     if cid not in wallets:
         company = neighbours.query(MODULE, "c3-m1", "query_company", companyId=cid)

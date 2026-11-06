@@ -31,12 +31,24 @@ from __future__ import annotations
 
 import datetime as dt
 import importlib
+import logging
+import os
 import threading
+import uuid
 from types import ModuleType
+from typing import Any
 
+from portal_common import events, neighbours
+from portal_common.problems import Problem
+
+from . import crypto, did
 from .store import InMemoryStore, WalletStore
 
+log = logging.getLogger(__name__)
+
 MODULE = "c4-m2"
+PROVIDERS = ("SAP_DIV", "IDENTITY_HUB", "CSP")
+HOLDER_ACCESS, STS_ACCESS = "HOLDER_ACCESS", "STS_ACCESS"
 
 _store: WalletStore | None = None
 _store_lock = threading.Lock()
@@ -68,7 +80,7 @@ def optional_module(name: str) -> ModuleType | None:
 
 
 def reset() -> None:
-    """Clear the store and the state held by this file."""
+    """Stop the timer and clear the store."""
     get_store().reset()
 
 
@@ -87,3 +99,280 @@ def log_step(input: dict, step: str, object_id: str | None, state: str) -> None:
     """Write a step-log entry (README 5 `step_log`)."""
     get_store().append_step_log({"step_run_id": input.get("stepRunId"), "process_id": input.get("processId"),
                                  "step": step, "object_id": object_id, "state": state, "occurred_at": now()})
+
+
+# --------------------------------------------------------------------------------------- helpers
+def _number(name: str, default: float) -> float:
+    """A positive number from the environment at call time; the default for unset or unusable values."""
+    try:
+        value = float(os.environ.get(name, "").strip())
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _when(value: Any) -> dt.datetime | None:
+    """A timezone-aware datetime from a datetime or an ISO string, None if there is none."""
+    if isinstance(value, str):
+        try:
+            value = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(value, dt.datetime):
+        return None
+    return value if value.tzinfo else value.replace(tzinfo=dt.timezone.utc)
+
+
+def _iso(value: Any) -> str | None:
+    moment = _when(value)
+    return moment.isoformat() if moment else None
+
+
+def _problem(status: int, name: str, detail: str | None = None, retryable: bool = False) -> Problem:
+    return Problem(MODULE, status, name, detail=detail, retryable=retryable)
+
+
+def providers_module() -> ModuleType | None:
+    """The providers file of C4-M2 if it exists (it is written by another person)."""
+    return optional_module("providers")
+
+
+def enabled_providers() -> list[str]:
+    """README 4: `ENABLED_PROVIDERS`, empty = `SAP_DIV,IDENTITY_HUB,CSP`."""
+    providers = providers_module()
+    if providers is not None:
+        return list(providers.enabled())
+    names = [n.strip().upper() for n in os.environ.get("ENABLED_PROVIDERS", "").split(",") if n.strip()]
+    return names or list(PROVIDERS)
+
+
+def default_provider() -> str:
+    """README 4: `DEFAULT_PROVIDER`, empty = `CSP`."""
+    providers = providers_module()
+    if providers is not None:
+        return providers.default_provider()
+    return os.environ.get("DEFAULT_PROVIDER", "").strip().upper() or "CSP"
+
+
+def get_company(company_id: str) -> dict | None:
+    """The view of C3-M1 (`name`, `bpn`, `status`); None if the company does not exist. Any other failure
+    of the neighbour raises `Problem` (502), see `portal_common.neighbours`."""
+    return neighbours.query(MODULE, "c3-m1", "query_company", companyId=company_id)
+
+
+def get_wallet(company_id: str) -> dict | None:
+    """The wallet row of a company."""
+    return get_store().get_wallet(company_id)
+
+
+def wallet_secret(wallet_id: str, kind: str) -> dict | None:
+    """The decrypted secret of a wallet: `{url, client_id, secret}`, None if there is none."""
+    row = get_store().get_secret(wallet_id, kind)
+    if row is None:
+        return None
+    return {"url": row["url"], "client_id": row["client_id"],
+            "secret": crypto.decrypt(row["secret_encrypted"], row["nonce"], row["key_version"])}
+
+
+def _store_secret(wallet_id: str, kind: str, access: dict) -> None:
+    """Encrypt and store `{url, client_id, secret}` (README 5 `wallet_secret`)."""
+    ciphertext, nonce, key_version = crypto.encrypt(access["secret"])
+    get_store().put_secret(wallet_id, kind, access["url"], access["client_id"], ciphertext, nonce, key_version)
+
+
+def _save(wallet: dict) -> dict:
+    wallet["changed_at"] = now()
+    get_store().put_wallet(wallet)
+    return wallet
+
+
+def _did_web_location(did_value: str | None) -> str | None:
+    """Location of the DID document by the `did:web` rules."""
+    if not did_value or not did_value.lower().startswith("did:web:"):
+        return None
+    parts = did_value.split(":")[2:]
+    return "https://" + "/".join(parts) + "/did.json" if parts else None
+
+
+def credential_service_url(document: dict) -> str | None:
+    """Endpoint of the service of type `CredentialService` in a DID document, if there is one."""
+    services = document.get("service") if isinstance(document, dict) else None
+    if isinstance(services, dict):
+        services = [services]
+    for entry in services if isinstance(services, list) else []:
+        kind = entry.get("type") if isinstance(entry, dict) else None
+        if kind == did.CREDENTIAL_SERVICE or (isinstance(kind, list) and did.CREDENTIAL_SERVICE in kind):
+            endpoint = entry.get("serviceEndpoint")
+            if isinstance(endpoint, str) and endpoint:
+                return endpoint
+    return None
+
+
+# ----------------------------------------------------------------------------- events and status
+def _wallet_created(wallet: dict) -> None:
+    events.publish(MODULE, "DataspaceWalletCreated", {
+        "companyId": wallet["company_id"], "did": wallet["did"], "walletId": wallet["id"],
+        "provider": wallet["provider"], "didDocumentLocation": wallet["did_document_location"],
+        "bpn": wallet["bpn"]})
+
+
+def _fail(wallet: dict, reason: str) -> dict:
+    """Status `FAILED` with the reason and the event `DataspaceWalletFailed` (README 6.2, 10)."""
+    wallet.update(status="FAILED", failure_reason=reason, next_check_at=None)
+    _save(wallet)
+    events.publish(MODULE, "DataspaceWalletFailed", {
+        "companyId": wallet["company_id"], "walletId": wallet["id"], "provider": wallet["provider"],
+        "reason": reason})
+    return wallet
+
+
+def _activate(wallet: dict, document: dict) -> dict:
+    """README 6.4 step 4: `did_validated_at`, the credential service of the document, status `ACTIVE`."""
+    moment = now()
+    wallet.update(status="ACTIVE", did_validated_at=moment, activated_at=moment, next_check_at=None,
+                  credential_service_url=credential_service_url(document) or wallet.get("credential_service_url"))
+    _save(wallet)
+    _wallet_created(wallet)
+    return wallet
+
+
+def check_did(wallet: dict) -> dict:
+    """One DID check of a `VALIDATING` wallet (README 6.4). Call it inside `transaction(company_id)`.
+
+    Wrong form: `FAILED` `DID_MISMATCH`. Not resolvable: the next attempt after
+    `DID_VALIDATION_INTERVAL_MINUTES`, after `DID_VALIDATION_MAX_HOURS` from `validating_since` `FAILED`
+    `DID_NOT_RESOLVABLE`. Invalid content: `FAILED` `INVALID_DID_DOCUMENT`. Otherwise `ACTIVE`."""
+    if not did.check_form(wallet["provider"], wallet["did"], wallet["bpn"]):
+        return _fail(wallet, "DID_MISMATCH")
+    document = did.resolve(wallet["did"])
+    moment = now()
+    if document is None:
+        started = _when(wallet.get("validating_since")) or moment
+        if moment >= started + dt.timedelta(hours=_number("DID_VALIDATION_MAX_HOURS", 168)):
+            return _fail(wallet, "DID_NOT_RESOLVABLE")
+        wallet["next_check_at"] = moment + dt.timedelta(minutes=_number("DID_VALIDATION_INTERVAL_MINUTES", 10))
+        return _save(wallet)
+    if did.check_document(wallet["provider"], wallet["did"], document):
+        return _fail(wallet, did.INVALID_DID_DOCUMENT)
+    return _activate(wallet, document)
+
+
+# ------------------------------------------------------------------------------------ create-wallet
+def _validate_create_input(input: dict) -> tuple[str, str | None]:
+    """README 8.1 step 1: the input of the step; returns `(companyId, provider or None)`."""
+    if not isinstance(input, dict):
+        raise _problem(400, "validation", "the input must be a JSON object")
+    for name in ("processId", "stepRunId", "companyId"):
+        value = input.get(name)
+        try:
+            if not isinstance(value, str):
+                raise ValueError
+            uuid.UUID(value)
+        except ValueError:
+            raise _problem(400, "validation", f"{name} must be a UUID") from None
+    provider = input.get("provider")
+    if provider is None:
+        return input["companyId"], None
+    if provider == "BRING_YOUR_OWN":
+        raise _problem(400, "provider-not-enabled", "BRING_YOUR_OWN is not available yet")
+    if provider not in PROVIDERS:
+        raise _problem(400, "validation", "provider must be SAP_DIV, IDENTITY_HUB or CSP")
+    return input["companyId"], provider
+
+
+def _choose_provider(requested: str | None) -> str:
+    """README 6.1: the provider of the input, otherwise `DEFAULT_PROVIDER`; it must be enabled."""
+    provider = requested or default_provider()
+    if provider not in enabled_providers():
+        raise _problem(400, "provider-not-enabled", f"{provider} is not in ENABLED_PROVIDERS")
+    return provider
+
+
+def _new_wallet(company_id: str, bpn: str, provider: str) -> dict:
+    moment = now()
+    return {"id": str(uuid.uuid4()), "company_id": company_id, "bpn": bpn, "provider": provider,
+            "status": "REQUESTED", "failure_reason": None, "did": None, "did_document_location": None,
+            "credential_service_url": None, "provider_ref": None, "control_challenge_id": None, "attempt": 1,
+            "provider_ordered_at": None, "validating_since": None, "did_validated_at": None,
+            "next_check_at": None, "activated_at": None, "created_at": moment, "changed_at": moment}
+
+
+def _reset_for_new_attempt(wallet: dict, provider: str) -> dict:
+    """README 6.2: a new attempt after `FAILED` deletes the secrets, clears `did` and the progress fields."""
+    get_store().delete_secrets(wallet["id"])
+    wallet.update(provider=provider, status="REQUESTED", failure_reason=None, did=None,
+                  did_document_location=None, credential_service_url=None, provider_ref=None,
+                  provider_ordered_at=None, validating_since=None, did_validated_at=None, next_check_at=None,
+                  activated_at=None, attempt=int(wallet.get("attempt") or 1) + 1)
+    return _save(wallet)
+
+
+def _order(wallet: dict, company: dict) -> dict:
+    """README 8.1 step 4: the order to the adapter. `provider_ordered_at` is set only after it accepted."""
+    providers = providers_module()
+    if providers is None:
+        raise _problem(502, "upstream-error", "no provider adapter available", retryable=True)
+    answer = providers.get(wallet["provider"]).order_wallet({
+        "company_id": wallet["company_id"], "bpn": wallet["bpn"], "company_name": company.get("name"),
+        "attempt": wallet["attempt"], "wallet_id": wallet["id"]})
+    # An in-process stand-in may already have called back while ordering: continue from the stored row.
+    wallet = get_store().get_wallet(wallet["company_id"]) or wallet
+    moment = now()
+    if answer.get("result") == "CREATED":
+        for kind, access in (answer.get("secrets") or {}).items():
+            _store_secret(wallet["id"], kind, access)
+        wallet.update(status="VALIDATING", did=answer["did"], did_document_location=answer.get("did_document_location"),
+                      credential_service_url=answer.get("credential_service_url"),
+                      provider_ref=answer.get("provider_ref"), provider_ordered_at=moment,
+                      validating_since=moment, next_check_at=moment)
+        _save(wallet)
+        return check_did(wallet)           # README 8.1 step 5: try the DID check at once
+    wallet["provider_ordered_at"] = wallet.get("provider_ordered_at") or moment
+    wallet["provider_ref"] = wallet.get("provider_ref") or wallet["bpn"]
+    return _save(wallet)
+
+
+def _step_result(wallet: dict) -> dict:
+    """README 8.1 result (openapi `StepResultWallet`); no secrets."""
+    result = {"walletId": wallet["id"], "companyId": wallet["company_id"], "provider": wallet["provider"],
+              "status": wallet["status"]}
+    if wallet.get("did"):
+        result["did"] = wallet["did"]
+    if wallet.get("did_document_location"):
+        result["didDocumentLocation"] = wallet["did_document_location"]
+    if wallet.get("failure_reason"):
+        result["failureReason"] = wallet["failure_reason"]
+    return result
+
+
+def create_wallet(input: dict) -> dict:
+    """The step `create-wallet` (README 8.1). Long-running: `RUNNING` unless the wallet was already `ACTIVE`."""
+    company_id, requested = _validate_create_input(input)
+    store = get_store()
+    with store.transaction(company_id):
+        company = get_company(company_id)
+        if company is None:
+            raise _problem(404, "not-found", "company not found")
+        if not company.get("bpn"):
+            raise _problem(409, "company-not-ready", "the company has no BPN yet")
+        bpn = str(company["bpn"]).upper()
+        wallet = store.get_wallet(company_id)
+        other = store.find_wallet_by_bpn(bpn)
+        if (wallet and wallet["bpn"] != bpn) or (other and other["company_id"] != company_id):
+            raise _problem(409, "conflict", "the BPN does not match the existing wallets")
+        state = "RUNNING"
+        if wallet is None:
+            wallet = _save(_new_wallet(company_id, bpn, _choose_provider(requested)))
+            wallet = _order(wallet, company)
+        elif wallet["status"] == "ACTIVE":
+            state = "DONE"
+        elif wallet["status"] == "FAILED":
+            wallet = _reset_for_new_attempt(wallet, _choose_provider(requested))
+            wallet = _order(wallet, company)
+        elif wallet["status"] == "REQUESTED" and not wallet.get("provider_ordered_at"):
+            wallet = _order(wallet, company)
+        # REQUESTED with `provider_ordered_at` and VALIDATING: nothing else (RUNNING)
+        log_step(input, "create-wallet", company_id, state)
+        return {"stepRunId": input["stepRunId"], "state": state, "result": _step_result(wallet)}
+
+
