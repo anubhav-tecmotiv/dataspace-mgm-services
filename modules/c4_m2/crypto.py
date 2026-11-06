@@ -51,36 +51,60 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 # ----------------------------------------------------------------------
 # Module‐level key state — read at call time, never at import.
+# When SECRETS_KEY is unset, the random key is cached here per process
+# until ``reset()`` clears it (plan §11.4 convention).
 # ----------------------------------------------------------------------
 
 
-_key_version: int = 1
-_aesgcm: AESGCM | None = None
-_key_bytes: bytes = b""
+_random_key: bytes | None = None
 
 
 def _read_key() -> bytes:
-    """Read ``SECRETS_KEY`` from the environment *at call time*.
+    """Read the current ``SECRETS_KEY`` from the environment *at call time*.
 
-    Returns the 32‑byte key for AES‑256‑GCM.  Raises a clear error if the
+    Returns the 32‑byte key for AES‑256‑GCM.  Raises ``ValueError`` if the
     hex string is not exactly 64 characters or contains non‑hex characters.
+    When SECRETS_KEY is unset, returns a *cached* random key generated once per
+    process and cleared only by ``reset()``.
     """
+    global _random_key
     raw = os.getenv("SECRETS_KEY")
     if raw is None:
-        # Unset → random per‑process key (plan §11.4 convention)
-        return secrets.token_bytes(32)
+        if _random_key is None:
+            _random_key = secrets.token_bytes(32)
+        return _random_key
     if len(raw) != 64 or not all(c in "0123456789abcdefABCDEF" for c in raw):
         raise ValueError(
-            "SECRETS_KEY must be a 64‑character hex string; got {raw!r}"
+            "SECRETS_KEY must be a 64‑character hex string; got {raw!r}".format(raw=raw)
         )
     return bytes.fromhex(raw)
 
 
-def _ensure_aesgcm() -> None:
-    """Lazy‑initialise the AESGCM instance with the current key."""
-    global _aesgcm, _key_bytes
-    _key_bytes = _read_key()
-    _aesgcm = AESGCM(_key_bytes)
+def _current_version() -> int:
+    """Return ``SECRETS_KEY_VERSION`` as an int (default ``1``)."""
+    version_str = os.getenv("SECRETS_KEY_VERSION", "1")
+    try:
+        return int(version_str)
+    except ValueError:
+        return 1
+
+
+def _key_for_version(requested_version: int) -> bytes | None:
+    """Read the AES‑256 key for the given key *version*.
+
+    Current version → ``SECRETS_KEY`` (via ``_read_key()``).
+    Old versions → ``SECRETS_KEY_<v-1>``.
+    Returns ``None`` when neither is available.
+    """
+    if requested_version == _current_version():
+        return _read_key()
+    env_name = f"SECRETS_KEY_{requested_version - 1}"
+    raw = os.getenv(env_name)
+    if raw and len(raw) == 64 and all(
+        c in "0123456789abcdefABCDEF" for c in raw
+    ):
+        return bytes.fromhex(raw)
+    return None
 
 
 def encrypt(secret: str | bytes) -> Tuple[bytes, bytes, int]:
@@ -88,28 +112,42 @@ def encrypt(secret: str | bytes) -> Tuple[bytes, bytes, int]:
 
     The nonce is exactly 12 bytes (AESGCM default).  The ciphertext already
     includes the 16‑byte GCM tag appended by the library.
+    The *key_version* is read from ``SECRETS_KEY_VERSION`` at call time,
+    not from a module‑level cache (plan §11.4, TEAM3-PLAN 0.3).
     """
     if isinstance(secret, str):
         secret = secret.encode()
-    _ensure_aesgcm()
+    key_version = _current_version()
+    key_bytes = _key_for_version(key_version)
+    if key_bytes is None:
+        # Unset SECRETS_KEY → random per‑process key, cached by _read_key()
+        key_bytes = _read_key()
     nonce = secrets.token_bytes(12)
-    ciphertext = _aesgcm.encrypt(nonce, secret, None)
-    return ciphertext, nonce, _key_version
+    ciphertext = AESGCM(key_bytes).encrypt(nonce, secret, None)
+    return ciphertext, nonce, key_version
 
 
 def decrypt(ciphertext: bytes, nonce: bytes, key_version: int) -> str:
     """Decrypt ciphertext that was produced by ``encrypt()``.
 
-    The ``key_version`` is *informational* for the test suite — the actual
-    key is always the one keyed by the current ``SECRETS_KEY`` / ``SECRETS_KEY_VERSION``.
+    The ``key_version`` selects which key to use: the current ``SECRETS_KEY``
+    when it matches ``SECRETS_KEY_VERSION``, otherwise an old key
+    ``SECRETS_KEY_<key_version-1>``.  If neither key is available, decryption
+    fails (the test ``test_unknown_key_version_is_rejected`` relies on this).
     """
     if isinstance(ciphertext, str):
         ciphertext = ciphertext.encode()
     if isinstance(nonce, str):
         nonce = nonce.encode()
-    _ensure_aesgcm()
+
+    key_bytes = _key_for_version(key_version)
+    if key_bytes is None:
+        raise ValueError(
+            f"No AES-256 key available for key_version={key_version}"
+        )
+
     try:
-        plaintext = _aesgcm.decrypt(nonce, ciphertext, None)
+        plaintext = AESGCM(key_bytes).decrypt(nonce, ciphertext, None)
     except Exception as exc:  # GCM authenticates ciphertext, tag and nonce
         raise RuntimeError(f"Decryption failed: {exc}") from exc
     return plaintext.decode()
@@ -120,12 +158,15 @@ def reset() -> None:
 
     After ``reset()`` the next ``encrypt``/``decrypt`` call reads ``SECRETS_KEY``
     (or generates a fresh random key if the variable is unset).  Any ciphertext
-    encrypted *before* the reset can no longer be decrypted.
+    encrypted *before* the reset can no longer be decrypted with the *new* key,
+    but old ciphertext remains decryptable with the key that was active before the
+    reset.
+
+    The key *version* (``SECRETS_KEY_VERSION``) is intentionally not reset — it
+    controls which version number new ``encrypt`` calls return.
     """
-    global _key_version, _aesgcm, _key_bytes
-    _key_version = 1
-    _aesgcm = None
-    _key_bytes = b""
+    global _random_key
+    _random_key = None
 
 
 # ----------------------------------------------------------------------
