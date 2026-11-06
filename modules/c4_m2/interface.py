@@ -96,7 +96,10 @@ def _standin_create_wallet(input: dict) -> dict:
             wallets[cid] = {"walletId": standin.stable_id("wallet", cid), "companyId": cid, "bpn": bpn,
                             "status": "ACTIVE", "provider": "STUB", "issuanceMode": "STUB", "supportsWalletAccounts": False,
                             "did": f"did:web:wallet.example.org:{bpn}", "providerRef": None, "_holder": None}
-        events.publish(MODULE, "DataspaceWalletCreated", {"companyId": cid, "did": wallets[cid]["did"]})
+        w = wallets[cid]
+        events.publish(MODULE, "DataspaceWalletCreated", {
+            "companyId": cid, "did": w["did"], "walletId": w["walletId"], "provider": w["provider"],
+            "didDocumentLocation": service.did_web_location(w["did"]), "bpn": bpn})
     return standin.step_reply(input, state="RUNNING")   # long-running; completed by DataspaceWalletCreated
 
 

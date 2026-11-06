@@ -187,7 +187,7 @@ def _save(wallet: dict) -> dict:
     return wallet
 
 
-def _did_web_location(did_value: str | None) -> str | None:
+def did_web_location(did_value: str | None) -> str | None:
     """Location of the DID document by the `did:web` rules."""
     if not did_value or not did_value.lower().startswith("did:web:"):
         return None
@@ -415,7 +415,7 @@ def _callback_document_valid(document: dict) -> bool:
 
 def _sap_div_location(bpn: str, did_value: str) -> str | None:
     base = os.environ.get("SAP_DIV_DID_DOCUMENT_BASE_URL", "").strip().rstrip("/")
-    return f"{base}/{bpn}/did.json" if base else _did_web_location(did_value)
+    return f"{base}/{bpn}/did.json" if base else did_web_location(did_value)
 
 
 def accept_wallet_callback(bpn: str, body: dict, claims: dict | str | None) -> None:
