@@ -132,13 +132,17 @@ class CspAdapter:
             status, answer = csp.request(url, method, path, body)
         except csp.CspUnavailable as error:
             raise common.upstream_error(f"CSP wallet API not reachable: {error}") from error
+        except (OSError, ValueError, KeyError) as error:
+            raise common.upstream_error(f"CSP sign-in failed: {type(error).__name__}") from error
         return status, answer if isinstance(answer, dict) else None
 
-    def _created(self, status: int, answer: dict | None, what: str) -> dict:
+    def _created(self, status: int, answer: dict | None, what: str, keys: tuple[str, ...] = ()) -> dict:
         if status == 403:
             raise common.provider_rejected(f"the CSP rejected the {what}")
         if status != 201 or not answer:
             raise common.upstream_error(f"CSP wallet API answered {status}")
+        if any(key not in answer for key in keys):
+            raise common.upstream_error("CSP wallet API answered without the expected fields")
         return answer
 
     def order_wallet(self, order: dict) -> dict:
@@ -147,7 +151,8 @@ class CspAdapter:
         if status == 409:
             self._call("DELETE", f"/wallets/{bpn}")
             status, answer = self._call("POST", "/wallets", {"bpn": bpn})
-        answer = self._created(status, answer, "wallet")
+        answer = self._created(status, answer, "wallet",
+                               ("did", "participantContextId", "identityApiUrl", "apiKey"))
         return {"result": "CREATED", "did": answer["did"], "did_document_location": common.did_location(answer["did"]),
                 "credential_service_url": answer.get("credentialServiceUrl"),
                 "provider_ref": answer["participantContextId"],
@@ -162,7 +167,7 @@ class CspAdapter:
         if status == 409:
             self._call("DELETE", f"/wallets/{bpn}/accounts/{ref}")
             status, answer = self._call("POST", f"/wallets/{bpn}/accounts", body)
-        answer = self._created(status, answer, "wallet account")
+        answer = self._created(status, answer, "wallet account", ("tokenUrl", "clientId", "clientSecret"))
         return {"result": "CREATED", "token_url": answer["tokenUrl"], "client_id": answer["clientId"],
                 "client_secret": answer["clientSecret"]}
 
