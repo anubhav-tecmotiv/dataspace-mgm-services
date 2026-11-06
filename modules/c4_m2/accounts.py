@@ -363,10 +363,13 @@ def retrieve_credentials(technical_user_id: str, claims: dict) -> dict:
             raise _problem(410, "credentials-expired", "the credentials were deleted after the retention period")
         if state != AVAILABLE:
             raise _problem(409, "no-credentials", "the wallet account has no credentials to retrieve")
-        row = store.pop_account_credentials(account["id"])
+        row = store.get_account_credentials(account["id"])
         if row is None:
             raise _problem(410, "already-retrieved", "the credentials were retrieved already")
+        # Decrypt before the row is removed: a failing key must not destroy credentials nobody has received.
         secret = crypto.decrypt(row["client_secret_encrypted"], row["nonce"], row["key_version"])
+        if store.pop_account_credentials(account["id"]) is None:
+            raise _problem(410, "already-retrieved", "the credentials were retrieved already")
         account["credentials_state"] = RETRIEVED
         _save(account)
         service.audit(claims, "RETRIEVE_WALLET_CREDENTIALS", account["company_id"], account["id"])
