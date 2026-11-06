@@ -144,8 +144,7 @@ class SapDivAdapter:
         failed = common.failures(bpn)
         did = f"did:web:other.example:{bpn}" if "DID_MISMATCH" in failed else self.did_for(bpn)
         document = common.did_document(did, STANDIN_CREDENTIAL_SERVICE, with_key="INVALID_DID_DOCUMENT" not in failed)
-        if "DID_NOT_RESOLVABLE" not in failed:
-            common.publish_document(did, document)
+        common.publish_document(did, document)      # `DID_NOT_RESOLVABLE` hides it in common.documents()
         if "NO_CALLBACK" not in failed:
             body = {"did": did, "didDocument": document,
                     "authenticationDetails": {"authenticationServiceUrl": STANDIN_AUTH_URL,

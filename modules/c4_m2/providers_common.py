@@ -99,8 +99,12 @@ def publish_document(did: str, document: dict) -> None:
 
 
 def documents() -> dict[str, dict]:
+    """DID -> document. `DID_NOT_RESOLVABLE` (README 14.3) hides the document of that BPN while it is set; it is
+    read at call time, so the document becomes resolvable as soon as the failure is removed."""
     with _lock:
-        return dict(_documents)
+        published = dict(_documents)
+    return {did: document for did, document in published.items()
+            if "DID_NOT_RESOLVABLE" not in failures(did.rsplit(":", 1)[-1])}
 
 
 def p256_jwk() -> dict:
@@ -130,10 +134,8 @@ def did_document(did: str, credential_service: str | None, with_key: bool = True
 
 def publish_wallet_document(bpn: str, did: str, credential_service: str | None) -> None:
     """The DID document of a stand-in wallet for the built-in resolution, with the failures of README 14.3:
-    `INVALID_DID_DOCUMENT` has no key, `DID_NOT_RESOLVABLE` is not published at all."""
+    `INVALID_DID_DOCUMENT` has no key; `DID_NOT_RESOLVABLE` hides the document in `documents()`."""
     failed = failures(bpn)
-    if "DID_NOT_RESOLVABLE" in failed:
-        return
     publish_document(did, did_document(did, credential_service, with_key="INVALID_DID_DOCUMENT" not in failed))
 
 
