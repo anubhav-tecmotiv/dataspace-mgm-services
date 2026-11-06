@@ -65,5 +65,18 @@ Where the spec is unclear, contradicts itself or is silent, the module follows t
 
 ## Wallet accounts and providers
 
-The open questions of `providers.py` and `accounts.py` (adapters, wallet accounts, credentials retrieval)
-are added to this file by their owner.
+| # | Question | Spec | Reading implemented | Who could decide |
+|---|---|---|---|---|
+| 21 | Account callback deadline variable: README 6.10 says only "the deadline". | 6.3, 6.10 | `PROVIDER_CALLBACK_TIMEOUT_MINUTES` (default 1440), as for wallets (`accounts.py`). | Spec authors |
+| 22 | `WalletAccountDeletionFailed` after the deadline: repeated or only once? | 6.3 | Published once: the first timer pass past the deadline sets `deletion_failed_at`, later passes skip the account. A REQUESTED account past the deadline fails with `PROVIDER_TIMEOUT`. | Spec authors |
+| 23 | Wallet account for a company with no wallet row at all. | 8.2 | 409 `wallet-not-active`; 404 is also conceivable. | Spec authors |
+| 24 | `provider_name` of an account: README 5 names SAP DIV and CSP, 8.2 step 3 says every account. | 5, 8.2 | `tu-` + `technicalUserId` for every provider, IdentityHub included. | Spec authors |
+| 25 | `credentials_state` of an account that becomes DELETED without a retrieval. | 6.3, 6.7 | Unchanged (stays `AVAILABLE`); only the credentials row is deleted, no state transition is named. | Spec authors |
+| 26 | Deleting a FAILED account: does the step answer RUNNING or DONE? | 8.3, 6.9 | The account row is deleted at once (`DELETED`), but the step still answers `RUNNING` (as for every first delete call). | Spec authors |
+| 27 | `delete-wallet-account` with a wrong `walletAccountRef` on a REQUESTED account: conflict (Input paragraph) or `invalid-state` (Preconditions)? | 8.3 | Preconditions first: 409 `invalid-state`; the ref conflict is checked afterwards. | Spec authors |
+| 28 | The SAP DIV stand-in answers an account deletion immediately (README 11.1: "Deletion: immediate callback"), but 11.1 also says callbacks come after `STUB_CALLBACK_DELAY_SECONDS`. | 11.1 | Every stand-in callback, the account deletion callback included, goes through `schedule()` and is delayed by `STUB_CALLBACK_DELAY_SECONDS`; only a value of 0 makes it immediate. | Spec authors |
+| 29 | Defaults for unset provider and timing variables (the shipped config sets none). | 4, 11.1, 11.2 | `IDENTITYHUB_DID_BASE` `ih.example.org`; SAP DIV stand-in DID base `https://div-stub.invalid/did` (when `SAP_DIV_DID_DOCUMENT_BASE_URL` is empty); `SAP_DIV_CALLBACK_CLIENT_ID` `sa-div-callback`; `STUB_CALLBACK_DELAY_SECONDS` 1; `ACCOUNT_CREDENTIALS_RETENTION_DAYS` 30; IdentityHub credential service, identity API and STS token URL default to `https://ih.example.org/api/...`. | Spec authors, operations |
+| 30 | Request building against a real SAP DIV middleware or IdentityHub (paths, bodies, headers). | 11.1, 11.2 | Built from the README text (`/setup-dim`, `/technical-user/{bpn}`, `/technical-user/{bpn}/delete`; `x-api-key` for the IdentityHub). Only the stand-ins are tested; no real endpoint was available. | Spec authors, SAP / IdentityHub operators |
+| 31 | What `providers.orders()` records (README only says "no second order to the stand-in"). | 13, 14.3 | Every order a stand-in received, including repeats and an order that the stand-in then answers with 409 or 404. Not recorded: orders refused by an injected `ORDER_ERROR` (all stand-ins) or `CSP_REJECTED` (CSP wallet order). | Team |
+| 32 | CSP answer 403 on a wallet account order. | 11.3 | 403 on a wallet or account creation maps to `provider-rejected` (409, not retryable) in `providers_csp.py`. The built-in CSP stand-in only injects `CSP_REJECTED` for the wallet order, not for the account order. | Spec authors |
+| 33 | The test kit lists company `c0000001-...` twice: as `csp` (ACTIVE) and as `u1` (REQUESTED). | 7a, testdata | Account tests use the later entry as the CSP company and start it ACTIVE (see the comment in `tests/test_c4_m2_accounts.py`). | Kit owners |
