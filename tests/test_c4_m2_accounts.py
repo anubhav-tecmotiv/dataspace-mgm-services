@@ -81,6 +81,13 @@ _steps = itertools.count(100)
 _VIEW = "/api/c4-m2/technical-users/{}/wallet-account"
 
 
+@pytest.fixture(autouse=True)
+def _csp_company_is_active(companies):
+    # The kit lists the CSP company (c0000001-...) twice, as "csp" (ACTIVE) and as "u1" (REQUESTED); the later
+    # entry wins in the fake C3-M1. README 8.2 needs an ACTIVE company for a new wallet account.
+    companies.set_status(COMPANIES["csp"]["id"], "ACTIVE")
+
+
 # ------------------------------------------------------------------------------------------ helpers
 def m2():
     return seam("modules.c4_m2.interface")
