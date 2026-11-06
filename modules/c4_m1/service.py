@@ -373,3 +373,51 @@ def list_company_credentials(company_id: str) -> list[dict]:
         views.setdefault(t, {"credentialType": t, "status": "NONE", "requestedAt": None, "issuedAt": None,
                              "revokedAt": None})
     return [views[t] for t in sorted(views, key=lambda t: TYPES.index(t) if t in TYPES else len(TYPES))]
+
+
+def _detail_view(row: dict) -> dict:
+    """OSP view (README 7.2): every field except secrets (`CredentialDetail`)."""
+    return {"id": row["id"], "companyId": row["company_id"], "credentialType": row["credential_type"],
+            "status": row["status"], "route": row["route"], "issuerDid": row.get("issuer_did") or None,
+            "walletProvider": row.get("wallet_provider"), "bpn": row.get("bpn"), "holderDid": row.get("holder_did"),
+            "requestRef": row.get("request_ref") or None, "attempt": row["attempt"],
+            "requestedAt": _iso(row.get("requested_at")), "issuedAt": _iso(row.get("issued_at")),
+            "failedAt": _iso(row.get("failed_at")), "revokedAt": _iso(row.get("revoked_at")),
+            "failureReason": row.get("failure_reason"), "revocationReason": row.get("revocation_reason"),
+            "createdAt": _iso(row["created_at"]), "changedAt": _iso(row["changed_at"])}
+
+
+def list_credentials(statuses=None, credential_type=None, company_id=None, route=None, requested_before=None,
+                     page: int = 0, size: int = 20) -> dict:
+    """README 7.2: filters, sorted by `changedAt` descending, paged."""
+    if requested_before is not None and requested_before.tzinfo is None:
+        requested_before = requested_before.replace(tzinfo=dt.UTC)
+    filters = dict(company_id=company_id, statuses=statuses, credential_type=credential_type, route=route,
+                   requested_before=requested_before)
+    rows = store().list_credentials(page=page, size=size, **filters)
+    return {"items": [_detail_view(r) for r in rows], "page": page, "size": size,
+            "total": store().count_credentials(**filters)}
+
+
+# ---------------------------------------------------------------------------------- confirm-revocation
+def confirm_revocation(credential_id: str, body: object, claims: dict) -> dict:
+    """README 7.3: `REVOCATION_PENDING` becomes `REVOKED` (history with the note, audit entry with `sub` of the
+    person, `CredentialRevoked`); `REVOKED` stays as it is (200); any other status is 409 `invalid-state`."""
+    note = body.get("note") if isinstance(body, dict) else None
+    if not isinstance(note, str) or not 1 <= len(note) <= 500:
+        raise _validation("note must be a string of 1 to 500 characters")
+    found = store().get_credential_by_id(credential_id)
+    if found is None:
+        raise Problem(MODULE, 404, "not-found", detail="unknown credential")
+    with store().transaction(found["company_id"]):
+        row = store().get_credential_by_id(credential_id)
+        if row["status"] == "REVOKED":
+            return _detail_view(row)
+        if row["status"] != "REVOCATION_PENDING":
+            raise Problem(MODULE, 409, "invalid-state", detail=f"credential is {row['status']}, not REVOCATION_PENDING")
+        _change(row, "REVOKED", note, revoked_at=now())
+        audit(claims, "CONFIRM_REVOCATION", None, row["id"], 200)
+        events.publish(MODULE, "CredentialRevoked", {
+            "companyId": row["company_id"], "credentialType": row["credential_type"],
+            "revocationReason": row.get("revocation_reason") or "OTHER"})
+        return _detail_view(row)
