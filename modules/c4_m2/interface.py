@@ -107,10 +107,24 @@ def _wallet(cid: str) -> dict:
 
 
 def get_wallet_info(*, companyId: str) -> dict:
+    """Query `getWalletInfo` (README 9.1): the wallet without secrets."""
+    if _implemented():
+        return service.wallet_info(companyId)
     return {k: v for k, v in _wallet(companyId).items() if not k.startswith("_")}
 
 
-def get_holder_access(*, companyId: str) -> dict:
+def wallet_view(*, companyId: str) -> dict:
+    """Body of `GET /companies/{companyId}/wallet` (README 7.1, openapi `Wallet`)."""
+    if _implemented():
+        return service.wallet_view(companyId)
+    return get_wallet_info(companyId=companyId)
+
+
+def get_holder_access(*, companyId: str, claims: dict | None = None) -> dict:
+    """Query `getHolderAccess` (README 9.3), only for C4-M1. `claims` is set by the HTTP route; in the same
+    process the audit entry holds the name of the calling module."""
+    if _implemented():
+        return service.holder_access(companyId, claims)
     w = _wallet(companyId)
     if not w["_holder"]:
         raise Problem(MODULE, 409, "invalid-state", detail="no holder access for provider STUB")

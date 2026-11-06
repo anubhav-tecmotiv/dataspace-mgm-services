@@ -525,3 +525,58 @@ def stop_timer() -> None:
     _timer = None
 
 
+# -------------------------------------------------------------------------------------- queries
+def _issuance_mode(provider: str) -> str:
+    return "ISSUER_WRITES" if provider == "SAP_DIV" else "HOLDER_REQUESTS"
+
+
+def _wallet_or_404(company_id: str) -> dict:
+    wallet = get_store().get_wallet(company_id)
+    if wallet is None:
+        raise _problem(404, "not-found", "no wallet for this company")
+    return wallet
+
+
+def wallet_info(company_id: str) -> dict:
+    """README 9.1 `WalletInfo`: 13 fields, no secrets."""
+    wallet = _wallet_or_404(company_id)
+    return {"walletId": wallet["id"], "companyId": wallet["company_id"], "bpn": wallet["bpn"],
+            "provider": wallet["provider"], "providerRef": wallet.get("provider_ref"), "status": wallet["status"],
+            "did": wallet.get("did"), "didDocumentLocation": wallet.get("did_document_location"),
+            "credentialServiceUrl": wallet.get("credential_service_url"),
+            "issuanceMode": _issuance_mode(wallet["provider"]), "supportsWalletAccounts": True,
+            "failureReason": wallet.get("failure_reason"), "activatedAt": _iso(wallet.get("activated_at"))}
+
+
+def wallet_view(company_id: str) -> dict:
+    """README 7.1 openapi `Wallet`: the view of the people of the company, no secrets."""
+    wallet = _wallet_or_404(company_id)
+    return {"companyId": wallet["company_id"], "provider": wallet["provider"], "status": wallet["status"],
+            "did": wallet.get("did"), "didDocumentLocation": wallet.get("did_document_location"),
+            "credentialServiceUrl": wallet.get("credential_service_url"),
+            "bdrsUrl": os.environ.get("BDRS_PUBLIC_URL", "").strip() or None,
+            "stsTokenUrl": (os.environ.get("IDENTITYHUB_STS_TOKEN_URL", "").strip() or None)
+            if wallet["provider"] == "IDENTITY_HUB" else None,
+            "supportsWalletAccounts": True, "failureReason": wallet.get("failure_reason"),
+            "createdAt": _iso(wallet.get("created_at")), "activatedAt": _iso(wallet.get("activated_at"))}
+
+
+def holder_access(company_id: str, claims: dict | str | None = None) -> dict:
+    """README 9.3 for C4-M1: how credentials get into the wallet, with the access needed for that.
+    `claims` are the token claims over HTTP; in the same process the entry holds the name of C4-M1."""
+    wallet = _wallet_or_404(company_id)
+    if wallet["status"] != "ACTIVE":
+        raise _problem(409, "wallet-not-active", "the wallet is not ACTIVE")
+    access = wallet_secret(wallet["id"], HOLDER_ACCESS)
+    if access is None:
+        raise _problem(409, "wallet-not-active", "the wallet has no holder access")
+    base = {"issuanceMode": _issuance_mode(wallet["provider"]), "companyId": wallet["company_id"],
+            "bpn": wallet["bpn"], "did": wallet["did"], "provider": wallet["provider"]}
+    if wallet["provider"] == "SAP_DIV":
+        base.update(holder=wallet["did_document_location"], walletUrl=access["url"],
+                    clientId=access["client_id"], clientSecret=access["secret"])
+    else:
+        base.update(identityApiUrl=access["url"], participantContextId=access["client_id"],
+                    apiKey=access["secret"], credentialServiceUrl=wallet.get("credential_service_url"))
+    audit(claims if claims is not None else "c4-m1", "READ_HOLDER_ACCESS", wallet["company_id"], wallet["id"])
+    return base
