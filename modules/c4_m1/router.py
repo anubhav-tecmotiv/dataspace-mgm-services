@@ -29,10 +29,11 @@ Operations that this router does not implement are answered by the spec-driven f
 from __future__ import annotations
 
 from fastapi import Body
+from fastapi.responses import Response
 
 from portal_common import standin
 
-from . import interface
+from . import interface, service
 from .interface import MODULE
 
 STANDIN = True
@@ -46,3 +47,13 @@ def reset() -> None:
 @router.post("/steps/issue-credentials")
 def issue(body: dict = Body(...), _: dict = standin.perm(MODULE, "POST", "/steps/issue-credentials")):
     return interface.issue_credentials(body)
+
+
+@router.post("/issuer-callbacks/{credentialKind}", status_code=204, response_class=Response)
+def issuer_callback(credentialKind: str, body: dict = Body(...),
+                    claims: dict = standin.perm(MODULE, "POST", "/issuer-callbacks/{credentialKind}")):
+    """README 7.4: token and permission (dependency), kind, body, row handling, audit entry, 204 without body."""
+    bpn, status, message = service.validate_report(credentialKind, body)
+    interface.report_status(credentialKind, bpn, status, message)
+    service.audit(claims, "REPORT_CREDENTIAL_STATUS", None, f"{bpn}:{credentialKind.upper()}", 204)
+    return Response(status_code=204)
