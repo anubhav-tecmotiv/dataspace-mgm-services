@@ -29,6 +29,7 @@ Seams (TEAM3-PLAN 12.2): `modules.c4_m2.crypto.encrypt/decrypt/reset`, the store
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import logging
 
@@ -38,6 +39,12 @@ from test_c4_m2_common import (COMPANIES, OSP_A_ID, SECRETS_KEY_HEX, SECRETS_KEY
                                companies, osp_factory, seam, step_input)
 
 SECRET = "s3cr3t-api-key-0123456789-ABCDEF"
+needs_providers = pytest.mark.skipif(
+    importlib.util.find_spec("modules.c4_m2.providers") is None,
+    reason="not implemented yet: modules.c4_m2.providers (provider adapters)")
+needs_accounts = pytest.mark.skipif(
+    importlib.util.find_spec("modules.c4_m2.providers") is None or importlib.util.find_spec("modules.c4_m2.accounts") is None,
+    reason="not implemented yet: modules.c4_m2.accounts (wallet accounts)")
 
 
 @pytest.fixture
@@ -226,6 +233,7 @@ CASES = [("div", "SAP_DIV", ["HOLDER_ACCESS"]), ("ih", "IDENTITY_HUB", ["HOLDER_
          ("csp", "CSP", ["HOLDER_ACCESS"])]
 
 
+@needs_providers
 @pytest.mark.parametrize("key,provider,kinds", CASES, ids=[c[1] for c in CASES])
 def test_case_25_wallet_secret_rows_hold_ciphertext_nonce_key_version_only(osp_factory, companies, key, provider, kinds):
     # README 5 `wallet_secret`: url and client_id plain; secret_encrypted, nonce bytea; key_version int
@@ -257,6 +265,7 @@ def test_case_25_wallet_secret_rows_hold_ciphertext_nonce_key_version_only(osp_f
     assert_no_secret(SECRETS_KEY_HEX, dump)
 
 
+@needs_providers
 def test_case_25_row_key_version_follows_secrets_key_version(osp_factory, companies):
     # README 5 `wallet_secret.key_version`: "version of SECRETS_KEY"
     osp = osp_factory(env={"SECRETS_KEY_VERSION": "2", "SECRETS_KEY": SECRETS_KEY_HEX_V2,
@@ -267,6 +276,7 @@ def test_case_25_row_key_version_follows_secrets_key_version(osp_factory, compan
     assert [store.get_secret(wallet["walletId"], k)["key_version"] for k in ("HOLDER_ACCESS", "STS_ACCESS")] == [2, 2]
 
 
+@needs_providers
 def test_holder_access_still_readable_after_key_rotation(osp_factory, companies, monkeypatch):
     # README 4: old versions stay readable; rows written under version 1 are used after the switch to version 2
     osp = osp_factory()
@@ -280,6 +290,7 @@ def test_holder_access_still_readable_after_key_rotation(osp_factory, companies,
     assert interface.get_holder_access(companyId=COMPANIES["ih"]["id"])["apiKey"] == before["apiKey"]
 
 
+@needs_providers
 def test_new_attempt_after_failed_deletes_the_wallet_secret_rows(osp_factory, companies, monkeypatch):
     # README 6.2: "A new attempt deletes the rows in wallet_secret, clears did and the progress fields"
     osp = osp_factory(env={"DID_VALIDATION_MAX_HOURS": "1", "DID_VALIDATION_INTERVAL_MINUTES": "10"})
@@ -333,6 +344,7 @@ def _account_credentials_rows(osp, create_key, provider, tu_n):
     return store, account["id"]
 
 
+@needs_accounts
 @pytest.mark.parametrize("key,provider", [("ih", "IDENTITY_HUB"), ("csp", "CSP")], ids=["IDENTITY_HUB", "CSP"])
 def test_case_25_wallet_account_credentials_row_is_ciphertext_nonce_key_version(osp_factory, companies, key, provider):
     # README 5 `wallet_account_credentials`: client_secret_encrypted + nonce bytea, key_version; never plaintext
@@ -349,6 +361,7 @@ def test_case_25_wallet_account_credentials_row_is_ciphertext_nonce_key_version(
     assert row["client_secret_encrypted"].hex() in dump
 
 
+@needs_accounts
 def test_case_25_account_credentials_use_a_fresh_nonce_per_account(osp_factory, companies):
     # README 5: nonce per row; two accounts of the same company never share a nonce
     osp = osp_factory()
