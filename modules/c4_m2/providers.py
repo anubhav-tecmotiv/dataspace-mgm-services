@@ -20,139 +20,73 @@
 #  that the code is correct.
 #
 #  SPDX-License-Identifier: Apache-2.0 AND CC0-1.0
-#  Assisted-By: OpenCode (DeepSeek V4.1 Flash Free)
+#  Assisted-By: Claude Code (claude-sonnet-5-5)
 #################################################################################
-"""C4-M2 Dataspace Wallet Interface — provider adapter registry.
+"""Provider adapters of C4-M2: the registry, the choice of the provider (README 6.1) and the stand-in helpers.
 
-This module owns the provider choice logic (§6.1, §6.2) and the adapter registry
-(§6.11) used by the wallet steps.  It is package‑free: a single file imported
-by `interface.py`, `router.py` and the test suite through the `seam(...)` helper.
-
-The built‑in stand‑ins for **SAP_DIV**, **IDENTITY_HUB** and **CSP** are defined
-here so that the test suite can call `seam("modules.c4_m2.providers").get("SAP_DIV")`
-etc. without touching the real middleware.
-
-Milestone M0 — skeleton only (no implementation, no stubs).
+The adapters (README 6.11) are in `providers_sap_div.py`, `providers_identity_hub.py` and `providers_csp.py`; the
+SAP DIV callback routes in `providers_callbacks.py`. Everything the core (`service.py`) and the tests need is
+reached through this file: `get`, `enabled`, `default_provider`, `callback_routers`, `stand_in_documents`,
+`orders`, `flush_stand_in` and `reset`. Environment variables are read at call time.
 """
 from __future__ import annotations
 
+import os
 
-# ----------------------------------------------------------------------
-# Public API — the test suite reaches these names through `seam(...)`.
-# Do NOT rename without also updating `test_c4_m2_providers.py` and
-# `test_c4_m2_accounts.py` (TEAM3-PLAN §12.1 rule 1).
-# ----------------------------------------------------------------------
+from fastapi import APIRouter
 
+from . import providers_common as common
+from . import providers_csp, providers_identity_hub, providers_sap_div
 
-def get(provider: str) -> None:
-    """Return an adapter for the given provider name.
-
-    Valid provider names are ``"SAP_DIV"``, ``"IDENTITY_HUB"`` and ``"CSP"``.
-    The actual adapter objects are created on demand by the step implementation.
-    """
-    raise NotImplementedError
+PROVIDERS = ("SAP_DIV", "IDENTITY_HUB", "CSP")
+_ADAPTERS = {"SAP_DIV": providers_sap_div.SapDivAdapter(), "IDENTITY_HUB": providers_identity_hub.IdentityHubAdapter(),
+             "CSP": providers_csp.CspAdapter()}
 
 
-def enabled() -> bool:
-    """Return ``True`` if at least one provider is enabled.
+def get(provider: str):
+    """The adapter of `SAP_DIV`, `IDENTITY_HUB` or `CSP`."""
+    try:
+        return _ADAPTERS[provider]
+    except KeyError:
+        raise ValueError(f"no adapter for provider {provider!r}") from None
 
-    The ``ENABLED_PROVIDERS`` environment variable (``config/osp-*/module-config.json``)
-    decides which providers the installation offers.
-    """
-    raise NotImplementedError
+
+def enabled() -> list[str]:
+    """README 4 `ENABLED_PROVIDERS`: comma-separated, empty = `SAP_DIV,IDENTITY_HUB,CSP`."""
+    names = [name.strip().upper() for name in os.environ.get("ENABLED_PROVIDERS", "").split(",") if name.strip()]
+    chosen = [name for name in dict.fromkeys(names) if name in PROVIDERS]
+    return chosen or list(PROVIDERS)
 
 
 def default_provider() -> str:
-    """Return the default provider name.
-
-    ``ENABLED_PROVIDERS`` empty ``→`` ``"CSP"`` (the hackathon default).
-    """
-    raise NotImplementedError
+    """README 4 `DEFAULT_PROVIDER`: empty = `CSP`."""
+    return os.environ.get("DEFAULT_PROVIDER", "").strip().upper() or "CSP"
 
 
-def orders() -> list[dict[str, str]]:
-    """Return the list of wallet orders that have been placed.
+def callback_routers() -> list[APIRouter]:
+    """The routers of the adapters that get callbacks (README 7.6), without prefix."""
+    routers = [adapter.callback_router() for adapter in _ADAPTERS.values()]
+    return [router for router in routers if router is not None]
 
-    Each entry is ``{"provider": ..., "bpn": ..., "kind": ...}``
-    following the TEAM3-PLAN 12.2 convention (not the README wording).
-    """
-    raise NotImplementedError
+
+def stand_in_documents() -> dict[str, dict]:
+    """DID -> DID document of every built-in stand-in wallet, for the built-in resolution (README 11.4)."""
+    return common.documents()
+
+
+def orders() -> list[dict]:
+    """Every order a built-in stand-in received: `{provider, bpn, kind}` plus `external_id` for accounts."""
+    return common.orders()
 
 
 def flush_stand_in() -> None:
-    """Fire any pending stand‑in callbacks that have been delayed by
-    ``STUB_CALLBACK_DELAY_SECONDS``.
-
-    The test suite drives the timer manually with ``service.run_timer_once()``,
-    so this function is called explicitly — never on a background timer during
-    tests.
-    """
-    raise NotImplementedError
+    """Run every pending stand-in callback now (tests do not wait for `STUB_CALLBACK_DELAY_SECONDS`)."""
+    common.flush()
 
 
 def reset() -> None:
-    """Clear all internal state (orders, timers, stand‑in callbacks).
-
-    Called at the start of each test to guarantee isolation.
-    """
-    raise NotImplementedError
-
-
-# ----------------------------------------------------------------------
-# Built‑in stand‑in adapters — one per provider.
-# ----------------------------------------------------------------------
-
-
-class _Adapter:
-    """Minimal adapter that the stand‑in routes return.
-
-    The real implementation will replace these with adapters that talk to
-    SAP DIV, IdentityHub or the CSP wallet API.
-    """
-
-    def __init__(self, name: str):
-        self.name = name
-        self.provider = name
-
-
-sap_div = _Adapter("SAP_DIV")
-identity_hub = _Adapter("IDENTITY_HUB")
-csp = _Adapter("CSP")
-
-
-def get_impl(provider: str) -> _Adapter:
-    """Internal helper — map a provider name to its built‑in adapter."""
-    return {"SAP_DIV": sap_div, "IDENTITY_HUB": identity_hub, "CSP": csp}[provider]
-
-
-# ----------------------------------------------------------------------
-# Lazy‑load helpers used by the test suite's `seam(...)` calls.
-# The test suite imports these through `seam("modules.c4_m2.providers")`.
-# ----------------------------------------------------------------------
-
-
-def __getattr__(name: str):
-    """Make ``seam("modules.c4_m2.providers").orders()`` etc. work.
-
-    This function is only reached when the test suite lazily imports the
-    module via the seam helper; it is not a normal import path.
-    """
-    if name == "get":
-        return get
-    if name == "enabled":
-        return enabled
-    if name == "default_provider":
-        return default_provider
-    if name == "orders":
-        return orders
-    if name == "flush_stand_in":
-        return flush_stand_in
-    if name == "reset":
-        return reset
-    if name == "sap_div":
-        return sap_div
-    if name == "identity_hub":
-        return identity_hub
-    if name == "csp":
-        return csp
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    """Forget orders, documents, pending callbacks and the state of the built-in stand-ins."""
+    common.reset()
+    providers_sap_div.reset()
+    providers_identity_hub.reset()
+    providers_csp.reset()
