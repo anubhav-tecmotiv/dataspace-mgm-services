@@ -142,7 +142,7 @@ class IdentityHubAdapter:
         if status not in (200, 201) or not answer:
             raise common.upstream_error(f"IdentityHub answered {status}")
         identity_api = os.environ.get("IDENTITYHUB_URL", "").strip() or DEFAULT_IDENTITY_API
-        return {"result": "CREATED", "did": did, "did_document_location": None,
+        return {"result": "CREATED", "did": did, "did_document_location": common.did_location(did),
                 "credential_service_url": _credential_service(context), "provider_ref": context,
                 "secrets": {"HOLDER_ACCESS": {"url": identity_api, "client_id": context, "secret": answer["apiKey"]},
                             "STS_ACCESS": {"url": _sts_token_url(), "client_id": answer["clientId"],
