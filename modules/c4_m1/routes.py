@@ -36,7 +36,11 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 
+import httpx
+
+from portal_common import csp, http, neighbours, settings
 from portal_common.problems import Problem
 
 MODULE = "c4-m1"
@@ -160,6 +164,196 @@ class StubRoute:
             self.orders.clear()
 
 
+# ------------------------------------------------------------------------------------- helpers
+def _upstream(detail: str) -> Problem:
+    return Problem(MODULE, 502, "upstream-error", detail=detail, retryable=True)
+
+
+def _callback_url(kind: str) -> str:
+    """`{CALLBACK_BASE_URL}/api/c4-m1/issuer-callbacks/{kind}`; without the variable the address of the
+    installation (OPEN-QUESTIONS.md)."""
+    base = (os.environ.get("CALLBACK_BASE_URL") or settings.base_url()).rstrip("/")
+    return f"{base}/api/c4-m1/issuer-callbacks/{kind}"
+
+
+def _definitions(variable: str, default: str) -> dict[str, str]:
+    out = {}
+    for part in (os.environ.get(variable) or default).split(","):
+        if ":" in part:
+            t, ident = part.split(":", 1)
+            out[t.strip().upper()] = ident.strip()
+    return out
+
+
+def _member_of() -> str | None:
+    return (settings.get("dataspace") or {}).get("memberOf")
+
+
+def _holder_access(ctx: dict) -> dict:
+    """Holder access from C4-M2, once per run just before the first order; kept in memory only."""
+    if "access" not in ctx:
+        access = neighbours.query(MODULE, "c4-m2", "get_holder_access", companyId=ctx["company"]["id"])
+        if not access:
+            raise Problem(MODULE, 409, "wallet-not-ready", detail="no holder access for the wallet", retryable=False)
+        ctx["access"] = access
+    return ctx["access"]
+
+
+def _identity_request(ctx: dict, credential_type: str, attempt: int, issuer_did: str, identifier: str) -> str:
+    """Credential request in the identity interface of the holder's wallet (README 11.4); returns `holderPid`."""
+    access = _holder_access(ctx)
+    holder_pid = f"{ctx['company']['id']}:{credential_type}:{attempt}"
+    credential = {"type": identifier, "format": os.environ.get("CREDENTIAL_FORMAT") or "VC1_0_JWT"}
+    try:
+        r = http.request("POST", f"{access['identityApiUrl'].rstrip('/')}/participants/{access['participantContextId']}"
+                         "/credentials/request",
+                         json={"issuerDid": issuer_did, "holderPid": holder_pid, "credentials": [credential]},
+                         headers={"x-api-key": access["apiKey"]})
+    except httpx.HTTPError as e:
+        raise _upstream(f"wallet identity API: {type(e).__name__}") from e
+    if not r.is_success:
+        raise _upstream(f"wallet identity API answered {r.status_code}")
+    return holder_pid
+
+
+# ------------------------------------------------------------------------------------- CSP_ISSUER
+class CspIssuerRoute:
+    """CSP issuer (README 11.5): holder and grant at the CSP, request in the holder's wallet."""
+
+    name = CSP_ISSUER
+
+    @staticmethod
+    def _csp(method: str, path: str, body: dict | None = None, revocation: bool = False) -> None:
+        try:
+            status, _ = csp.request(os.environ.get("CSP_ISSUER_URL", ""), method, path, body)
+        except csp.CspUnavailable as e:
+            raise _upstream(f"CSP issuer: {e}") from e
+        if 200 <= status < 300:
+            return
+        if not revocation and status in (403, 404, 409, 422):
+            raise Problem(MODULE, 409, "issuer-rejected", detail=f"CSP issuer answered {status}", retryable=False)
+        raise _upstream(f"CSP issuer answered {status}")
+
+    def prepare(self, ctx: dict) -> None:
+        _holder_access(ctx)                       # once per run, never sent to the CSP
+        self._csp("PUT", f"/holders/{ctx['company']['bpn'].upper()}", {"did": ctx["wallet"]["did"]})
+
+    def order(self, ctx: dict, credential_type: str, attempt: int) -> tuple[str, str | None]:
+        bpn, kind = ctx["company"]["bpn"].upper(), credential_type.lower()
+        grant = {"callbackUrl": _callback_url(kind)}
+        if kind == "membership":
+            grant["memberOf"] = _member_of()
+        self._csp("PUT", f"/holders/{bpn}/grants/{kind}", grant)
+        issuer_did = os.environ.get("CSP_ISSUER_DID") or "did:web:issuer.csp.example.org"
+        identifier = _definitions("CSP_ISSUER_CREDENTIAL_DEFINITIONS", "BPN:bpn,MEMBERSHIP:membership")[credential_type]
+        return _identity_request(ctx, credential_type, attempt, issuer_did, identifier), issuer_did
+
+    def _remove_grant(self, row: dict) -> None:
+        self._csp("DELETE", f"/holders/{row['bpn']}/grants/{row['credential_type'].lower()}", revocation=True)
+
+    def cancel(self, row: dict) -> None:
+        """README 8.2: the grant is removed first, so that a request still running is no longer issued."""
+        self._remove_grant(row)
+
+    def revoke(self, row: dict) -> bool:
+        self._remove_grant(row)                   # 204: removes the grant and revokes issued credentials
+        return True
+
+
+# ---------------------------------------------------------------------------------- CREDENTIAL_ISSUER
+_issuer_tokens: dict[str, tuple[str, float]] = {}
+
+
+class CredentialIssuerRoute:
+    """Own Credential Issuer (README 11.3): the issuer writes into the wallet; revocation is not supported in 0.2."""
+
+    name = CREDENTIAL_ISSUER
+
+    @staticmethod
+    def _token() -> str:
+        url = os.environ.get("CREDENTIAL_ISSUER_TOKEN_URL", "")
+        cached = _issuer_tokens.get(url)
+        if cached and cached[1] > time.time() + 30:
+            return cached[0]
+        try:
+            r = http.request("POST", url, data={"grant_type": "client_credentials",
+                                                "client_id": os.environ.get("CREDENTIAL_ISSUER_CLIENT_ID", ""),
+                                                "client_secret": os.environ.get("CREDENTIAL_ISSUER_CLIENT_SECRET", "")})
+            body = r.json() if r.status_code == 200 else {}
+        except (httpx.HTTPError, ValueError) as e:
+            raise _upstream(f"Credential Issuer token endpoint: {type(e).__name__}") from e
+        if "access_token" not in body:
+            raise _upstream(f"Credential Issuer token endpoint answered {r.status_code}")
+        _issuer_tokens[url] = (body["access_token"], time.time() + int(body.get("expires_in", 300)))
+        return body["access_token"]
+
+    def prepare(self, ctx: dict) -> None:
+        _holder_access(ctx)
+
+    def order(self, ctx: dict, credential_type: str, attempt: int) -> tuple[str, str | None]:
+        access, kind = _holder_access(ctx), credential_type.lower()
+        body = {"holder": access["holder"], "businessPartnerNumber": ctx["company"]["bpn"].upper(),
+                "technicalUserDetails": {"walletUrl": access["walletUrl"], "clientId": access["clientId"],
+                                         "clientSecret": access["clientSecret"]},
+                "callbackUrl": _callback_url(kind)}
+        if kind == "membership":
+            body["memberOf"] = _member_of()
+        try:
+            r = http.request("POST", os.environ.get("CREDENTIAL_ISSUER_URL", "").rstrip("/") + f"/api/issuer/{kind}",
+                             json=body, headers={"Authorization": "Bearer " + self._token()})
+        except httpx.HTTPError as e:
+            raise _upstream(f"Credential Issuer: {type(e).__name__}") from e
+        if not r.is_success:                      # every 2xx counts as accepted
+            raise _upstream(f"Credential Issuer answered {r.status_code}")
+        return "", None
+
+    def cancel(self, row: dict) -> None:
+        """Nothing to remove at the Credential Issuer."""
+
+    def revoke(self, row: dict) -> bool:
+        return False                              # README 6.3: not supported -> REVOCATION_PENDING
+
+
+# ------------------------------------------------------------------------------------ ISSUER_SERVICE
+class IssuerServiceRoute:
+    """Own IssuerService (README 11.4). The paths of the administration interface are provisional (the spec says
+    to check them against the version in use, OPEN-QUESTIONS.md)."""
+
+    name = ISSUER_SERVICE
+
+    @staticmethod
+    def _admin(method: str, path: str, body: dict | None = None, accept: tuple[int, ...] = ()) -> None:
+        pid = os.environ.get("ISSUER_SERVICE_PARTICIPANT_ID") or "issuer"
+        try:
+            r = http.request(method, os.environ.get("ISSUER_SERVICE_ADMIN_URL", "").rstrip("/")
+                             + f"/api/admin/participants/{pid}{path}", json=body,
+                             headers={"x-api-key": os.environ.get("ISSUER_SERVICE_API_KEY", "")})
+        except httpx.HTTPError as e:
+            raise _upstream(f"IssuerService: {type(e).__name__}") from e
+        if not (r.is_success or r.status_code in accept):
+            raise _upstream(f"IssuerService answered {r.status_code}")
+
+    def prepare(self, ctx: dict) -> None:
+        _holder_access(ctx)
+        company = ctx["company"]
+        self._admin("POST", "/holders", {"holderId": company["bpn"].upper(), "did": ctx["wallet"]["did"],
+                                         "name": company.get("name"), "properties": {"memberOf": _member_of()}},
+                    accept=(409,))                # an existing holder counts as success
+
+    def order(self, ctx: dict, credential_type: str, attempt: int) -> tuple[str, str | None]:
+        issuer_did = os.environ.get("ISSUER_DID", "")
+        identifier = _definitions("ISSUER_SERVICE_CREDENTIAL_DEFINITIONS", "BPN:bpn,MEMBERSHIP:membership")[credential_type]
+        return _identity_request(ctx, credential_type, attempt, issuer_did, identifier), issuer_did
+
+    def cancel(self, row: dict) -> None:
+        """Nothing to remove."""
+
+    def revoke(self, row: dict) -> bool:
+        ident = _definitions("ISSUER_SERVICE_CREDENTIAL_DEFINITIONS", "BPN:bpn,MEMBERSHIP:membership")[row["credential_type"]]
+        self._admin("POST", f"/holders/{row['bpn']}/credentials/revoke", {"credentialDefinition": ident})
+        return True
+
+
 _stub = StubRoute()
 
 
@@ -171,7 +365,10 @@ def stub_orders() -> list[dict]:
 def get(name: str):
     if name == STUB:
         return _stub
-    raise _no_route(f"route {name} is not available")
+    routes = {CSP_ISSUER: CspIssuerRoute, CREDENTIAL_ISSUER: CredentialIssuerRoute, ISSUER_SERVICE: IssuerServiceRoute}
+    if name not in routes:
+        raise _no_route(f"route {name} is not available")
+    return routes[name]()
 
 
 def reset() -> None:
