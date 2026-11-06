@@ -347,6 +347,9 @@ def _account_credentials_rows(osp, create_key, provider, tu_n):
 @needs_accounts
 @pytest.mark.parametrize("key,provider", [("ih", "IDENTITY_HUB"), ("csp", "CSP")], ids=["IDENTITY_HUB", "CSP"])
 def test_case_25_wallet_account_credentials_row_is_ciphertext_nonce_key_version(osp_factory, companies, key, provider):
+    # The kit lists the CSP company twice, as "csp" (ACTIVE) and as "u1" (REQUESTED); the later entry wins in the
+    # fake C3-M1, and README 8.2 needs an ACTIVE company for a new wallet account.
+    companies.set_status(COMPANIES["csp"]["id"], "ACTIVE")
     # README 5 `wallet_account_credentials`: client_secret_encrypted + nonce bytea, key_version; never plaintext
     osp = osp_factory(env={"SECRETS_KEY_VERSION": "2", "SECRETS_KEY": SECRETS_KEY_HEX_V2, "SECRETS_KEY_1": SECRETS_KEY_HEX})
     store, ref = _account_credentials_rows(osp, key, provider, 1)
@@ -363,6 +366,9 @@ def test_case_25_wallet_account_credentials_row_is_ciphertext_nonce_key_version(
 
 @needs_accounts
 def test_case_25_account_credentials_use_a_fresh_nonce_per_account(osp_factory, companies):
+    # The kit lists the CSP company twice, as "csp" (ACTIVE) and as "u1" (REQUESTED); the later entry wins in the
+    # fake C3-M1, and README 8.2 needs an ACTIVE company for a new wallet account.
+    companies.set_status(COMPANIES["csp"]["id"], "ACTIVE")
     # README 5: nonce per row; two accounts of the same company never share a nonce
     osp = osp_factory()
     store, first = _account_credentials_rows(osp, "csp", "CSP", 1)
